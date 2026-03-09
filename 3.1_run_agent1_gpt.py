@@ -1,0 +1,535 @@
+#!/usr/bin/env python3
+
+import json
+import argparse
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import duckdb
+from openai import OpenAI
+
+# -----------------------------
+# Config da file (stesso formato degli altri script)
+# -----------------------------
+CONFIG_PATH = Path(__file__).resolve().parent / "config.txt"
+
+
+def load_config(path: Optional[Path] = None) -> Dict[str, str]:
+    p = path or CONFIG_PATH
+    config: Dict[str, str] = {}
+    if not p.exists():
+        raise FileNotFoundError(
+            f"File di configurazione non trovato: {p}\n"
+            "Crea config.txt (puoi copiare config.example.txt) e inserisci le chiavi richieste."
+        )
+    with open(p, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                key, _, value = line.partition("=")
+                config[key.strip()] = value.strip()
+    return config
+
+
+def get_config() -> Dict[str, str]:
+    if not hasattr(get_config, "_cache"):
+        get_config._cache = load_config()  # type: ignore[attr-defined]
+    return get_config._cache  # type: ignore[attr-defined]
+
+
+def _cfg(key: str, default: Optional[str] = None) -> str:
+    return get_config().get(key, default or "").strip()
+
+
+AGENT_NAME = "gpt5mini"
+DEFAULT_MODEL = "gpt-5-mini"
+
+client = OpenAI(api_key=_cfg("OPENAI_API_KEY"))
+
+
+def now_ts_naive_utc():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def norm(s):
+    if s is None:
+        return ""
+    return " ".join(str(s).strip().split())
+
+
+def connect_motherduck() -> duckdb.DuckDBPyConnection:
+    token = _cfg("MOTHERDUCK_TOKEN")
+    if not token:
+        raise RuntimeError("Manca MOTHERDUCK_TOKEN nel file di configurazione (config.txt)")
+    dbname = _cfg("MOTHERDUCK_DB", "my_db")
+    return duckdb.connect(f"md:{dbname}?token={token}")
+
+
+def ensure_agent_eval_table(con: duckdb.DuckDBPyConnection) -> None:
+    con.execute("""
+    CREATE TABLE IF NOT EXISTS my_db.mdr_reconciliation.MdrReconciliationAgentDecisions (
+      TaskId              VARCHAR NOT NULL,
+      AgentName           VARCHAR NOT NULL,
+      AgentModel          VARCHAR,
+      Document_title      VARCHAR NOT NULL,
+      PromptVersion       VARCHAR NOT NULL,
+      EmbeddingModel      VARCHAR NOT NULL,
+      SelectedTitleKey    VARCHAR,
+      SelectedRaciTitle   VARCHAR,
+      DecisionType        VARCHAR NOT NULL,   -- MATCH | NO_MATCH
+      Confidence          DOUBLE,
+      ReasoningSummary    VARCHAR NOT NULL,
+      CreatedAt           TIMESTAMP NOT NULL,
+      PRIMARY KEY (TaskId, AgentName)
+    );
+    """)
+
+
+def fetch_pending_tasks(
+    con: duckdb.DuckDBPyConnection,
+    prompt_version: str,
+    embedding_model: str,
+    limit: Optional[int] = None
+) -> List[Dict[str, Any]]:
+    params: List[Any] = [prompt_version, embedding_model]
+    sql = """
+        SELECT
+          TaskId,
+          Document_title,
+          PromptVersion,
+          EmbeddingModel,
+          CandidateCount,
+          Agent1Status,
+          Agent2Status,
+          JudgeStatus,
+          FinalStatus
+        FROM my_db.mdr_reconciliation.MdrReconciliationTasks
+        WHERE PromptVersion = ?
+          AND EmbeddingModel = ?
+          AND Agent1Status = 'pending'
+        ORDER BY Document_title
+    """
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    rows = con.execute(sql, params).fetchall()
+
+    cols = [
+        "TaskId", "Document_title", "PromptVersion", "EmbeddingModel",
+        "CandidateCount", "Agent1Status", "Agent2Status",
+        "JudgeStatus", "FinalStatus"
+    ]
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def claim_task_agent1(con: duckdb.DuckDBPyConnection, task_id: str) -> bool:
+    ts = now_ts_naive_utc()
+    con.execute("BEGIN;")
+    try:
+        rows = con.execute("""
+            UPDATE my_db.mdr_reconciliation.MdrReconciliationTasks
+            SET
+              Agent1Status = 'running',
+              FinalStatus = CASE
+                WHEN FinalStatus = 'pending' THEN 'in_progress'
+                ELSE FinalStatus
+              END,
+              UpdatedAt = ?
+            WHERE TaskId = ?
+              AND Agent1Status = 'pending'
+            RETURNING TaskId
+        """, [ts, task_id]).fetchall()
+        con.execute("COMMIT;")
+        return len(rows) == 1
+    except Exception:
+        con.execute("ROLLBACK;")
+        raise
+
+
+def fetch_candidates_for_task(
+    con: duckdb.DuckDBPyConnection,
+    document_title: str,
+    prompt_version: str,
+    embedding_model: str
+) -> List[Dict[str, Any]]:
+    rows = con.execute("""
+        SELECT
+          Rank,
+          Similarity,
+          TitleKey,
+          RaciTitle,
+          EffectiveDescription,
+          DisciplineName,
+          TypeName,
+          CategoryDescription,
+          ChapterName
+        FROM my_db.mdr_reconciliation.v_MdrReconciliationAgentInput
+        WHERE Document_title = ?
+          AND PromptVersion = ?
+          AND EmbeddingModel = ?
+        ORDER BY Rank
+    """, [document_title, prompt_version, embedding_model]).fetchall()
+
+    cols = [
+        "Rank", "Similarity", "TitleKey", "RaciTitle", "EffectiveDescription",
+        "DisciplineName", "TypeName", "CategoryDescription", "ChapterName"
+    ]
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def fetch_mdr_context(
+    con: duckdb.DuckDBPyConnection,
+    document_title: str
+) -> Dict[str, Any]:
+    row = con.execute("""
+        SELECT
+          Document_title,
+          Discipline_Normalized,
+          Discipline_Status,
+          Type_L1,
+          Type_L1_Status
+        FROM my_db.historical_mdr_normalization.v_MdrPreviousRecords_Normalized_All
+        WHERE Document_title = ?
+        LIMIT 1
+    """, [document_title]).fetchone()
+
+    if not row:
+        return {
+            "Document_title": document_title,
+            "Discipline_Normalized": None,
+            "Discipline_Status": None,
+            "Type_L1": None,
+            "Type_L1_Status": None,
+        }
+
+    cols = [
+        "Document_title",
+        "Discipline_Normalized",
+        "Discipline_Status",
+        "Type_L1",
+        "Type_L1_Status",
+    ]
+    return dict(zip(cols, row))
+
+
+RESPONSE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "decision_type": {
+            "type": "string",
+            "enum": ["MATCH", "NO_MATCH"]
+        },
+        "selected_titlekey": {
+            "type": ["string", "null"]
+        },
+        "selected_raci_title": {
+            "type": ["string", "null"]
+        },
+        "confidence": {
+            "type": "number"
+        },
+        "reasoning_summary": {
+            "type": "string"
+        }
+    },
+    "required": [
+        "decision_type",
+        "selected_titlekey",
+        "selected_raci_title",
+        "confidence",
+        "reasoning_summary"
+    ]
+}
+
+SYSTEM_PROMPT = """
+You are a specialist agent for document title reconciliation in EPC project documentation.
+
+Your task:
+Given one historical MDR title and 50 candidate standard RACI documents, choose the single best matching RACI document.
+
+Important rules:
+- You must choose ONLY among the provided 50 candidates.
+- If none of the 50 candidates is a credible semantic match, return NO_MATCH.
+- Prefer semantic correctness over lexical similarity.
+- Use the historical MDR title and the normalized metadata as context.
+- Use candidate title, description, discipline, type, category, chapter, rank, and similarity as evidence.
+- Do not invent missing information.
+- Be conservative: if evidence is weak or ambiguous, use NO_MATCH.
+- Confidence must be between 0 and 1.
+- reasoning_summary must be concise, factual, and no more than 80 words.
+
+Behavior examples:
+
+Example 1:
+If the MDR title clearly refers to a pressure test procedure, and one candidate is a pressure testing procedure with aligned scope and description, return:
+{
+  "decision_type": "MATCH",
+  "selected_titlekey": "ABC123",
+  "selected_raci_title": "Pressure Test Procedure",
+  "confidence": 0.91,
+  "reasoning_summary": "The MDR title explicitly refers to a pressure testing procedure, and the selected candidate best matches the purpose, scope, and technical content."
+}
+
+Example 2:
+If the MDR title is too generic, too noisy, or none of the 50 candidates is clearly aligned in meaning, return:
+{
+  "decision_type": "NO_MATCH",
+  "selected_titlekey": null,
+  "selected_raci_title": null,
+  "confidence": 0.78,
+  "reasoning_summary": "None of the available candidates provides a sufficiently clear semantic match for the MDR title."
+}
+"""
+
+
+def build_user_prompt(mdr_ctx: Dict[str, Any], candidates: List[Dict[str, Any]]) -> str:
+    blocks = []
+
+    blocks.append("HISTORICAL MDR RECORD")
+    blocks.append(f"Document_title: {norm(mdr_ctx.get('Document_title'))}")
+    blocks.append(f"Discipline_Normalized: {norm(mdr_ctx.get('Discipline_Normalized'))}")
+    blocks.append(f"Discipline_Status: {norm(mdr_ctx.get('Discipline_Status'))}")
+    blocks.append(f"Type_L1: {norm(mdr_ctx.get('Type_L1'))}")
+    blocks.append(f"Type_L1_Status: {norm(mdr_ctx.get('Type_L1_Status'))}")
+    blocks.append("")
+
+    blocks.append("CANDIDATES")
+    for c in candidates:
+        blocks.append("----")
+        blocks.append(f"Rank: {c['Rank']}")
+        blocks.append(f"Similarity: {float(c['Similarity']):.6f}")
+        blocks.append(f"TitleKey: {norm(c['TitleKey'])}")
+        blocks.append(f"RaciTitle: {norm(c['RaciTitle'])}")
+        blocks.append(f"EffectiveDescription: {norm(c['EffectiveDescription'])}")
+        blocks.append(f"DisciplineName: {norm(c['DisciplineName'])}")
+        blocks.append(f"TypeName: {norm(c['TypeName'])}")
+        blocks.append(f"CategoryDescription: {norm(c['CategoryDescription'])}")
+        blocks.append(f"ChapterName: {norm(c['ChapterName'])}")
+
+    blocks.append("")
+    blocks.append("Return JSON only.")
+    return "\n".join(blocks)
+
+
+def call_agent(model: str, mdr_ctx: Dict[str, Any], candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+    user_prompt = build_user_prompt(mdr_ctx, candidates)
+
+    resp = client.responses.create(
+        model=model,
+        input=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "mdr_title_agent_evaluation",
+                "schema": RESPONSE_SCHEMA,
+                "strict": True,
+            }
+        },
+    )
+
+    return json.loads(resp.output_text)
+
+
+def validate_agent_output(result: Dict[str, Any], candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+    candidate_map = {norm(c["TitleKey"]): c for c in candidates}
+
+    decision_type = result["decision_type"]
+    selected_titlekey = result["selected_titlekey"]
+    selected_raci_title = result["selected_raci_title"]
+    confidence = float(result["confidence"])
+    reasoning_summary = norm(result["reasoning_summary"])
+
+    if confidence < 0:
+        confidence = 0.0
+    if confidence > 1:
+        confidence = 1.0
+
+    if decision_type == "NO_MATCH":
+        return {
+            "DecisionType": "NO_MATCH",
+            "SelectedTitleKey": None,
+            "SelectedRaciTitle": None,
+            "Confidence": confidence,
+            "ReasoningSummary": reasoning_summary or "No credible match among the provided candidates."
+        }
+
+    if decision_type != "MATCH":
+        raise ValueError(f"Invalid decision_type: {decision_type}")
+
+    if not selected_titlekey:
+        raise ValueError("MATCH requires selected_titlekey")
+
+    selected_titlekey = norm(selected_titlekey)
+
+    if selected_titlekey not in candidate_map:
+        raise ValueError(f"SelectedTitleKey not in provided candidates: {selected_titlekey}")
+
+    candidate = candidate_map[selected_titlekey]
+
+    if not selected_raci_title:
+        selected_raci_title = norm(candidate["RaciTitle"])
+
+    return {
+        "DecisionType": "MATCH",
+        "SelectedTitleKey": selected_titlekey,
+        "SelectedRaciTitle": norm(selected_raci_title),
+        "Confidence": confidence,
+        "ReasoningSummary": reasoning_summary or "Selected best semantic match among provided candidates."
+    }
+
+
+def save_agent1_evaluation(
+    con: duckdb.DuckDBPyConnection,
+    task: Dict[str, Any],
+    model: str,
+    result: Dict[str, Any]
+) -> None:
+    ts = now_ts_naive_utc()
+
+    con.execute("BEGIN;")
+    try:
+        con.execute("""
+            INSERT INTO my_db.mdr_reconciliation.MdrReconciliationAgentDecisions
+              (TaskId, AgentName, AgentModel, Document_title, PromptVersion, EmbeddingModel,
+               SelectedTitleKey, SelectedRaciTitle, DecisionType, Confidence, ReasoningSummary, CreatedAt)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (TaskId, AgentName) DO UPDATE SET
+              AgentModel = excluded.AgentModel,
+              Document_title = excluded.Document_title,
+              PromptVersion = excluded.PromptVersion,
+              EmbeddingModel = excluded.EmbeddingModel,
+              SelectedTitleKey = excluded.SelectedTitleKey,
+              SelectedRaciTitle = excluded.SelectedRaciTitle,
+              DecisionType = excluded.DecisionType,
+              Confidence = excluded.Confidence,
+              ReasoningSummary = excluded.ReasoningSummary,
+              CreatedAt = excluded.CreatedAt
+        """, [
+            task["TaskId"],
+            AGENT_NAME,
+            model,
+            task["Document_title"],
+            task["PromptVersion"],
+            task["EmbeddingModel"],
+            result["SelectedTitleKey"],
+            result["SelectedRaciTitle"],
+            result["DecisionType"],
+            result["Confidence"],
+            result["ReasoningSummary"],
+            ts
+        ])
+
+        con.execute("""
+            UPDATE my_db.mdr_reconciliation.MdrReconciliationTasks
+            SET
+              Agent1Status = 'done',
+              FinalStatus = CASE
+                WHEN Agent2Status = 'done' THEN 'ready_for_judge'
+                ELSE 'in_progress'
+              END,
+              UpdatedAt = ?
+            WHERE TaskId = ?
+        """, [ts, task["TaskId"]])
+
+        con.execute("COMMIT;")
+    except Exception:
+        con.execute("ROLLBACK;")
+        raise
+
+def mark_agent1_error(con: duckdb.DuckDBPyConnection, task_id: str) -> None:
+    ts = now_ts_naive_utc()
+    con.execute("""
+        UPDATE my_db.mdr_reconciliation.MdrReconciliationTasks
+        SET
+          Agent1Status = 'error',
+          FinalStatus = 'error',
+          UpdatedAt = ?
+        WHERE TaskId = ?
+    """, [ts, task_id])
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--prompt-version", default=None, help="PromptVersion (default: from config.txt PROMPT_VERSION).")
+    ap.add_argument("--embedding-model", default=None, help="EmbeddingModel (default: from config.txt EMBEDDING_MODEL).")
+    ap.add_argument("--limit", type=int, default=None, help="Max number of tasks to process (default: no limit, process all pending).")
+    ap.add_argument("--model", default=None, help="OpenAI model for agent (default: from config OPENAI_AGENT1_MODEL or gpt-4o-mini).")
+    args = ap.parse_args()
+
+    args.prompt_version = args.prompt_version or _cfg("PROMPT_VERSION", "v1")
+    args.embedding_model = args.embedding_model or "text-embedding-3-small"
+    args.model = args.model or DEFAULT_MODEL
+
+    # Nessun --limit = processa tutti i pending; --limit N = al massimo N task
+    con = connect_motherduck()
+    ensure_agent_eval_table(con)
+
+    tasks = fetch_pending_tasks(
+        con=con,
+        prompt_version=args.prompt_version,
+        embedding_model=args.embedding_model,
+        limit=args.limit
+    )
+
+    print(f"Pending tasks fetched: {len(tasks)}")
+
+    for i, task in enumerate(tasks, start=1):
+        print(f"[{i}/{len(tasks)}] Processing: {task['Document_title']}")
+
+        claimed = claim_task_agent1(con, task["TaskId"])
+        if not claimed:
+            print(f"  Task already claimed/skipped: {task['TaskId']}")
+            continue
+
+        try:
+            candidates = fetch_candidates_for_task(
+                con=con,
+                document_title=task["Document_title"],
+                prompt_version=task["PromptVersion"],
+                embedding_model=task["EmbeddingModel"]
+            )
+
+            if not candidates:
+                print(f"  No candidates found, marking error for task {task['TaskId']}")
+                mark_agent1_error(con, task["TaskId"])
+                continue
+
+            mdr_ctx = fetch_mdr_context(con, task["Document_title"])
+
+            raw_result = call_agent(
+                model=args.model,
+                mdr_ctx=mdr_ctx,
+                candidates=candidates
+            )
+
+            validated_result = validate_agent_output(raw_result, candidates)
+
+            save_agent1_evaluation(
+                con=con,
+                task=task,
+                model=args.model,
+                result=validated_result
+            )
+
+            print(
+                f"  Saved -> decision={validated_result['DecisionType']} "
+                f"titlekey={validated_result['SelectedTitleKey']} "
+                f"confidence={validated_result['Confidence']:.3f}"
+            )
+
+        except Exception as e:
+            print(f"  ERROR: {e}")
+            mark_agent1_error(con, task["TaskId"])
+
+    con.close()
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()

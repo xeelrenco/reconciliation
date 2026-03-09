@@ -1,0 +1,23 @@
+# Configurazione per generate_doc_descriptions.py (versione parallela)
+# Copia questo file come config.txt e inserisci i valori reali.
+# Formato: una riga per chiave, chiave=valore. Le righe che iniziano con # sono commenti.
+
+# Obbligatori
+MOTHERDUCK_TOKEN=il_tuo_token_motherduck
+OPENAI_API_KEY=la_tua_chiave_openai
+# Opzionale per 3.2_run_agent2_claude.py (altrimenti usa variabile d'ambiente ANTHROPIC_API_KEY)
+ANTHROPIC_API_KEY=la_tua_chiave_anthropic
+
+# Opzionali (valori di default indicati)
+MOTHERDUCK_DB=my_db
+PROMPT_VERSION=v1
+LLM_MODEL=gpt-4o-mini
+
+# Parallelismo e batch
+BATCH_SIZE=25
+CONCURRENCY=6
+MAX_RETRIES=3
+SLEEP_S=0.0
+
+# Export (export_document_descriptions.py)
+EXPORT_OUTPUT_FILE=export_raci.xlsx
