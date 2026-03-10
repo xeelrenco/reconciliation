@@ -298,12 +298,10 @@ RESPONSE_SCHEMA = {
         "resolution_mode": {
             "type": "string",
             "enum": [
-                "UNANIMOUS",
-                "JUDGE_WITH_AGENT",
-                "ALL_DIFFERENT",
-                "NO_MATCH_CONFIRMED",
-                "MANUAL_REVIEW",
-                "JUDGE_OVERRIDE"
+                "agent_consensus",
+                "judge_override",
+                "no_credible_candidate",
+                "ambiguous_candidates"
             ]
         }
     },
@@ -322,24 +320,73 @@ You are the final judge for EPC document title reconciliation.
 
 You will receive:
 - one historical MDR title with normalized metadata
-- 50 candidate RACI documents
+- a list of 50 candidate RACI documents
 - the decisions of two independent agents (gpt5mini and claude)
 
 Your task:
-- decide the final outcome among MATCH, NO_MATCH, or MANUAL_REVIEW
-- if MATCH, choose the single best candidate only from the provided list
-- if evidence is weak, conflicting, or ambiguous, prefer MANUAL_REVIEW
-- if none of the candidates is credible, choose NO_MATCH
+Determine the final reconciliation outcome.
 
-Decision policy:
-- If both prior agents clearly point to the same correct candidate and evidence supports it, choose MATCH
-- If one prior agent is clearly right and the other is weaker, you may still choose MATCH
-- If both prior agents are wrong or evidence is insufficient, use NO_MATCH or MANUAL_REVIEW
-- Be conservative and precise
-- Confidence must be between 0 and 1
-- reasoning_summary must be concise, factual, and no more than 100 words
-- Do not invent information
-- Do not choose any candidate outside the provided list
+Allowed outcomes:
+- MATCH
+- NO_MATCH
+- MANUAL_REVIEW
+
+Definitions:
+
+MATCH
+Choose MATCH only if there is a single candidate that is clearly the best semantic match to the MDR document.
+
+NO_MATCH
+Choose NO_MATCH if none of the candidates is a credible match.
+
+MANUAL_REVIEW
+Choose MANUAL_REVIEW if at least one candidate appears plausible but the evidence is ambiguous, conflicting, or insufficient for a safe automatic match.
+
+Core principles:
+
+1. Be conservative and precise.
+2. Do not invent information.
+3. Do not rely on external knowledge.
+4. Only select candidates from the provided list.
+5. Similarity score is only a retrieval signal and must not be treated as proof of equivalence.
+6. Prefer semantic equivalence between the MDR title and the candidate description.
+7. Metadata compatibility (discipline, type, category, chapter) is important supporting evidence.
+8. Strong metadata incompatibility is a negative signal.
+9. Generic lexical overlap alone is not sufficient to justify MATCH.
+
+Use prior agent decisions as evidence, not authority.
+
+Decision logic:
+
+1. If both agents selected the same candidate AND the candidate is semantically consistent → MATCH is strongly supported.
+
+2. If the agents disagree:
+   - You may still choose MATCH if one candidate is clearly superior based on semantic meaning and metadata consistency.
+
+3. If none of the candidates is credible → choose NO_MATCH.
+
+4. If multiple candidates remain plausible and cannot be safely distinguished → choose MANUAL_REVIEW.
+
+Output requirements:
+
+Return JSON only with the following fields:
+- decision_type
+- selected_titlekey
+- selected_raci_title
+- confidence
+- resolution_mode
+- reasoning_summary
+
+resolution_mode (required): choose exactly one of:
+- agent_consensus: both agents selected the same candidate and you confirm it.
+- judge_override: you select one of the two agents' choice or a different candidate from the list.
+- no_credible_candidate: no candidate is plausible (use with NO_MATCH).
+- ambiguous_candidates: plausible candidates exist but are not clearly distinguishable (use with MANUAL_REVIEW).
+
+Rules:
+- confidence must be between 0 and 1
+- reasoning_summary must be concise and factual (maximum 100 words)
+- selected_titlekey and selected_raci_title must be null if decision_type is NO_MATCH or MANUAL_REVIEW
 """
 
 
@@ -349,6 +396,7 @@ def build_user_prompt(
     agent1: Dict[str, Any],
     agent2: Dict[str, Any]
 ) -> str:
+
     blocks = []
 
     blocks.append("HISTORICAL MDR RECORD")
@@ -359,7 +407,18 @@ def build_user_prompt(
     blocks.append(f"Type_L1_Status: {norm(mdr_ctx.get('Type_L1_Status'))}")
     blocks.append("")
 
+    blocks.append("EVALUATION GUIDANCE")
+    blocks.append("- SimilarityScore is a retrieval hint only, not proof of equivalence")
+    blocks.append("- Prefer semantic equivalence between MDR title and candidate meaning")
+    blocks.append("- Use discipline, type, category, and chapter as supporting evidence")
+    blocks.append("- Strong metadata incompatibility is a negative signal")
+    blocks.append("- Choose MATCH only if a single candidate is clearly the best")
+    blocks.append("- Choose NO_MATCH if none of the candidates is credible")
+    blocks.append("- Choose MANUAL_REVIEW if multiple candidates remain plausible or evidence conflicts")
+    blocks.append("")
+
     blocks.append("AGENT DECISIONS")
+
     blocks.append("Agent 1 (gpt5mini)")
     blocks.append(f"DecisionType: {norm(agent1.get('DecisionType'))}")
     blocks.append(f"SelectedTitleKey: {norm(agent1.get('SelectedTitleKey'))}")
@@ -367,6 +426,7 @@ def build_user_prompt(
     blocks.append(f"Confidence: {agent1.get('Confidence')}")
     blocks.append(f"ReasoningSummary: {norm(agent1.get('ReasoningSummary'))}")
     blocks.append("")
+
     blocks.append("Agent 2 (claude)")
     blocks.append(f"DecisionType: {norm(agent2.get('DecisionType'))}")
     blocks.append(f"SelectedTitleKey: {norm(agent2.get('SelectedTitleKey'))}")
@@ -376,10 +436,21 @@ def build_user_prompt(
     blocks.append("")
 
     blocks.append("CANDIDATES")
+
     for c in candidates:
+
+        selected_by = []
+
+        if str(c["TitleKey"]) == str(agent1.get("SelectedTitleKey")):
+            selected_by.append("Agent1")
+
+        if str(c["TitleKey"]) == str(agent2.get("SelectedTitleKey")):
+            selected_by.append("Agent2")
+
         blocks.append("----")
         blocks.append(f"Rank: {c['Rank']}")
-        blocks.append(f"Similarity: {float(c['Similarity']):.6f}")
+        blocks.append(f"SimilarityScore: {float(c['Similarity']):.4f}")
+        blocks.append(f"SelectedByAgents: {', '.join(selected_by) if selected_by else 'None'}")
         blocks.append(f"TitleKey: {norm(c['TitleKey'])}")
         blocks.append(f"RaciTitle: {norm(c['RaciTitle'])}")
         blocks.append(f"EffectiveDescription: {norm(c['EffectiveDescription'])}")
@@ -390,6 +461,7 @@ def build_user_prompt(
 
     blocks.append("")
     blocks.append("Return JSON only.")
+
     return "\n".join(blocks)
 
 
@@ -449,7 +521,7 @@ def validate_judge_output(result: Dict[str, Any], candidates: List[Dict[str, Any
             "FinalRaciTitle": None,
             "FinalConfidence": confidence,
             "FinalReason": reasoning_summary or "No final candidate selected.",
-            "ResolutionMode": resolution_mode or ("NO_MATCH_CONFIRMED" if decision_type == "NO_MATCH" else "MANUAL_REVIEW")
+            "ResolutionMode": resolution_mode or ("no_credible_candidate" if decision_type == "NO_MATCH" else "ambiguous_candidates")
         }
 
     if decision_type != "MATCH":
@@ -473,7 +545,7 @@ def validate_judge_output(result: Dict[str, Any], candidates: List[Dict[str, Any
         "FinalRaciTitle": norm(selected_raci_title),
         "FinalConfidence": confidence,
         "FinalReason": reasoning_summary or "Judge selected the best supported candidate.",
-        "ResolutionMode": resolution_mode or "JUDGE_OVERRIDE"
+        "ResolutionMode": resolution_mode or "judge_override"
     }
 
 
