@@ -11,6 +11,8 @@ ANTHROPIC_API_KEY=la_tua_chiave_anthropic
 # Opzionali (valori di default indicati)
 MOTHERDUCK_DB=my_db
 PROMPT_VERSION=v1
+# Opzionale per 3.3_run_judge.py: PromptVersion da scrivere in output (se vuoto = stesso di PROMPT_VERSION)
+JUDGE_OUTPUT_PROMPT_VERSION=
 LLM_MODEL=gpt-4o-mini
 
 # Parallelismo e batch

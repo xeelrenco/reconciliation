@@ -250,45 +250,58 @@ RESPONSE_SCHEMA = {
 SYSTEM_PROMPT = """
 You are a specialist agent for document title reconciliation in EPC project documentation.
 
+You will receive:
+- one historical MDR title with normalized metadata
+- a list of 50 candidate standard RACI documents
+
 Your task:
-Given one historical MDR title and 50 candidate standard RACI documents, choose the single best matching RACI document.
+Determine whether one candidate is a sufficiently credible semantic match.
 
-Important rules:
-- You must choose ONLY among the provided 50 candidates.
-- If none of the 50 candidates is a credible semantic match, return NO_MATCH.
-- Prefer semantic correctness over lexical similarity.
-- Use the historical MDR title and the normalized metadata as context.
-- Use candidate title, description, discipline, type, category, chapter, rank, and similarity as evidence.
+Allowed outcomes:
+- MATCH
+- NO_MATCH
+
+Definitions:
+
+MATCH
+Choose MATCH only if one candidate is clearly the best semantic match to the MDR record.
+
+NO_MATCH
+Choose NO_MATCH if no candidate is sufficiently credible based on semantic meaning and metadata consistency.
+
+Core principles:
+- Only select from the provided candidates.
 - Do not invent missing information.
-- Be conservative: if evidence is weak or ambiguous, use NO_MATCH.
-- Confidence must be between 0 and 1.
-- reasoning_summary must be concise, factual, and no more than 80 words.
+- Do not use external knowledge.
+- Similarity score and rank are retrieval hints, not proof of equivalence.
+- Prefer semantic equivalence over lexical overlap.
+- Use MDR metadata (discipline, document type) as context.
+- Use candidate title, description, discipline, type, category, and chapter as supporting evidence.
+- Strong metadata incompatibility is negative evidence.
+- Generic wording overlap alone is not sufficient for MATCH.
 
-Behavior examples:
+Decision rules:
+- Return MATCH only when one candidate is clearly stronger than the others.
+- If multiple candidates appear plausible but none is clearly superior, return NO_MATCH.
+- If the best candidate is still weak, generic, or not clearly equivalent, return NO_MATCH.
 
-Example 1:
-If the MDR title clearly refers to a pressure test procedure, and one candidate is a pressure testing procedure with aligned scope and description, return:
-{
-  "decision_type": "MATCH",
-  "selected_titlekey": "ABC123",
-  "selected_raci_title": "Pressure Test Procedure",
-  "confidence": 0.91,
-  "reasoning_summary": "The MDR title explicitly refers to a pressure testing procedure, and the selected candidate best matches the purpose, scope, and technical content."
-}
+Output format:
+Return JSON only with:
+- decision_type
+- selected_titlekey
+- selected_raci_title
+- confidence
+- reasoning_summary
 
-Example 2:
-If the MDR title is too generic, too noisy, or none of the 50 candidates is clearly aligned in meaning, return:
-{
-  "decision_type": "NO_MATCH",
-  "selected_titlekey": null,
-  "selected_raci_title": null,
-  "confidence": 0.78,
-  "reasoning_summary": "None of the available candidates provides a sufficiently clear semantic match for the MDR title."
-}
+Rules:
+- confidence must be between 0 and 1
+- selected_titlekey and selected_raci_title must be null when decision_type is NO_MATCH
+- reasoning_summary must be concise and factual (maximum 80 words)
 """
 
 
 def build_user_prompt(mdr_ctx: Dict[str, Any], candidates: List[Dict[str, Any]]) -> str:
+
     blocks = []
 
     blocks.append("HISTORICAL MDR RECORD")
@@ -299,11 +312,21 @@ def build_user_prompt(mdr_ctx: Dict[str, Any], candidates: List[Dict[str, Any]])
     blocks.append(f"Type_L1_Status: {norm(mdr_ctx.get('Type_L1_Status'))}")
     blocks.append("")
 
+    blocks.append("EVALUATION GUIDANCE")
+    blocks.append("- SimilarityScore is a retrieval hint only, not proof of equivalence")
+    blocks.append("- Prefer semantic equivalence between MDR title and candidate meaning")
+    blocks.append("- Use discipline, type, category, and chapter as supporting evidence")
+    blocks.append("- Strong metadata incompatibility is a negative signal")
+    blocks.append("- Choose MATCH only if one candidate is clearly stronger than the others")
+    blocks.append("- Choose NO_MATCH if the best candidate is still weak, generic, or not clearly equivalent")
+    blocks.append("")
+
     blocks.append("CANDIDATES")
+
     for c in candidates:
         blocks.append("----")
         blocks.append(f"Rank: {c['Rank']}")
-        blocks.append(f"Similarity: {float(c['Similarity']):.6f}")
+        blocks.append(f"SimilarityScore: {float(c['Similarity']):.4f}")
         blocks.append(f"TitleKey: {norm(c['TitleKey'])}")
         blocks.append(f"RaciTitle: {norm(c['RaciTitle'])}")
         blocks.append(f"EffectiveDescription: {norm(c['EffectiveDescription'])}")
@@ -314,6 +337,7 @@ def build_user_prompt(mdr_ctx: Dict[str, Any], candidates: List[Dict[str, Any]])
 
     blocks.append("")
     blocks.append("Return JSON only.")
+
     return "\n".join(blocks)
 
 

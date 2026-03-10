@@ -4,6 +4,7 @@ import json
 import argparse
 import queue
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -220,32 +221,58 @@ def fetch_mdr_context(
 SYSTEM_PROMPT = """
 You are a specialist agent for document title reconciliation in EPC project documentation.
 
+You will receive:
+- one historical MDR title with normalized metadata
+- a list of 50 candidate standard RACI documents
+
 Your task:
-Given one historical MDR title and 50 candidate standard RACI documents, choose the single best matching RACI document.
+Determine whether one candidate is a sufficiently credible semantic match.
 
-Important rules:
-- You must choose ONLY among the provided 50 candidates.
-- If none of the 50 candidates is a credible semantic match, return NO_MATCH.
-- Prefer semantic correctness over lexical similarity.
-- Use the historical MDR title and the normalized metadata as context.
-- Use candidate title, description, discipline, type, category, chapter, rank, and similarity as evidence.
+Allowed outcomes:
+- MATCH
+- NO_MATCH
+
+Definitions:
+
+MATCH
+Choose MATCH only if one candidate is clearly the best semantic match to the MDR record.
+
+NO_MATCH
+Choose NO_MATCH if no candidate is sufficiently credible based on semantic meaning and metadata consistency.
+
+Core principles:
+- Only select from the provided candidates.
 - Do not invent missing information.
-- Be conservative: if evidence is weak or ambiguous, use NO_MATCH.
-- Confidence must be between 0 and 1.
-- reasoning_summary must be concise, factual, and no more than 80 words.
+- Do not use external knowledge.
+- Similarity score and rank are retrieval hints, not proof of equivalence.
+- Prefer semantic equivalence over lexical overlap.
+- Use MDR metadata (discipline, document type) as context.
+- Use candidate title, description, discipline, type, category, and chapter as supporting evidence.
+- Strong metadata incompatibility is negative evidence.
+- Generic wording overlap alone is not sufficient for MATCH.
 
-Return JSON only with exactly these keys:
-{
-  "decision_type": "MATCH" or "NO_MATCH",
-  "selected_titlekey": string or null,
-  "selected_raci_title": string or null,
-  "confidence": number,
-  "reasoning_summary": string
-}
+Decision rules:
+- Return MATCH only when one candidate is clearly stronger than the others.
+- If multiple candidates appear plausible but none is clearly superior, return NO_MATCH.
+- If the best candidate is still weak, generic, or not clearly equivalent, return NO_MATCH.
+
+Output format:
+Return JSON only with:
+- decision_type
+- selected_titlekey
+- selected_raci_title
+- confidence
+- reasoning_summary
+
+Rules:
+- confidence must be between 0 and 1
+- selected_titlekey and selected_raci_title must be null when decision_type is NO_MATCH
+- reasoning_summary must be concise and factual (maximum 80 words)
 """
 
 
 def build_user_prompt(mdr_ctx: Dict[str, Any], candidates: List[Dict[str, Any]]) -> str:
+
     blocks = []
 
     blocks.append("HISTORICAL MDR RECORD")
@@ -256,11 +283,21 @@ def build_user_prompt(mdr_ctx: Dict[str, Any], candidates: List[Dict[str, Any]])
     blocks.append(f"Type_L1_Status: {norm(mdr_ctx.get('Type_L1_Status'))}")
     blocks.append("")
 
+    blocks.append("EVALUATION GUIDANCE")
+    blocks.append("- SimilarityScore is a retrieval hint only, not proof of equivalence")
+    blocks.append("- Prefer semantic equivalence between MDR title and candidate meaning")
+    blocks.append("- Use discipline, type, category, and chapter as supporting evidence")
+    blocks.append("- Strong metadata incompatibility is a negative signal")
+    blocks.append("- Choose MATCH only if one candidate is clearly stronger than the others")
+    blocks.append("- Choose NO_MATCH if the best candidate is still weak, generic, or not clearly equivalent")
+    blocks.append("")
+
     blocks.append("CANDIDATES")
+
     for c in candidates:
         blocks.append("----")
         blocks.append(f"Rank: {c['Rank']}")
-        blocks.append(f"Similarity: {float(c['Similarity']):.6f}")
+        blocks.append(f"SimilarityScore: {float(c['Similarity']):.4f}")
         blocks.append(f"TitleKey: {norm(c['TitleKey'])}")
         blocks.append(f"RaciTitle: {norm(c['RaciTitle'])}")
         blocks.append(f"EffectiveDescription: {norm(c['EffectiveDescription'])}")
@@ -271,6 +308,7 @@ def build_user_prompt(mdr_ctx: Dict[str, Any], candidates: List[Dict[str, Any]])
 
     blocks.append("")
     blocks.append("Return JSON only.")
+
     return "\n".join(blocks)
 
 
@@ -308,20 +346,37 @@ def extract_json_payload(raw_text: str) -> str:
     return text
 
 
+def _is_rate_limit_error(ex: BaseException) -> bool:
+    msg = str(ex).lower()
+    return "429" in msg or "rate_limit" in msg
+
+
 def call_agent(model: str, mdr_ctx: Dict[str, Any], candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
     user_prompt = build_user_prompt(mdr_ctx, candidates)
 
-    message = client.messages.create(
-        model=model,
-        max_tokens=600,
-        system=SYSTEM_PROMPT,
-        messages=[
-            {
-                "role": "user",
-                "content": user_prompt
-            }
-        ]
-    )
+    max_retries = 5
+    base_wait = 60  # seconds
+
+    for attempt in range(max_retries):
+        try:
+            message = client.messages.create(
+                model=model,
+                max_tokens=600,
+                system=SYSTEM_PROMPT,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": user_prompt
+                    }
+                ]
+            )
+            break
+        except Exception as e:
+            if _is_rate_limit_error(e) and attempt < max_retries - 1:
+                wait = base_wait * (2 ** attempt)
+                time.sleep(wait)
+                continue
+            raise
 
     raw_text = extract_text_from_anthropic_message(message)
     cleaned_json = extract_json_payload(raw_text)

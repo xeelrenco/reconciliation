@@ -83,12 +83,16 @@ def connect_motherduck() -> duckdb.DuckDBPyConnection:
 
 
 # --------------------------------------------------
-# Bootstrap final results table
+# Bootstrap final results table.
+# Chiave (TaskId, PromptVersion, EmbeddingModel): la PromptVersion in output
+# distingue le esecuzioni per test/comparazione; righe con versione diversa non
+# si sovrascrivono. Se la tabella esisteva con PK solo su TaskId, ricrearla:
+#   DROP TABLE my_db.mdr_reconciliation.MdrReconciliationResults;
 # --------------------------------------------------
 def ensure_final_results_table(con: duckdb.DuckDBPyConnection) -> None:
     con.execute(f"""
     CREATE TABLE IF NOT EXISTS {FINAL_RESULTS_TABLE} (
-      TaskId               VARCHAR PRIMARY KEY,
+      TaskId               VARCHAR NOT NULL,
       Document_title       VARCHAR NOT NULL,
       PromptVersion        VARCHAR NOT NULL,
       EmbeddingModel       VARCHAR NOT NULL,
@@ -96,10 +100,11 @@ def ensure_final_results_table(con: duckdb.DuckDBPyConnection) -> None:
       FinalRaciTitle       VARCHAR,
       FinalDecisionType    VARCHAR NOT NULL,   -- MATCH | NO_MATCH | MANUAL_REVIEW
       FinalConfidence      DOUBLE,
-      ResolutionMode       VARCHAR NOT NULL,   -- UNANIMOUS | JUDGE_WITH_AGENT | ALL_DIFFERENT | NO_MATCH_CONFIRMED | MANUAL_REVIEW
+      ResolutionMode       VARCHAR NOT NULL,
       FinalReason          VARCHAR NOT NULL,
       CreatedAt            TIMESTAMP NOT NULL,
-      UpdatedAt            TIMESTAMP NOT NULL
+      UpdatedAt            TIMESTAMP NOT NULL,
+      PRIMARY KEY (TaskId, PromptVersion, EmbeddingModel)
     );
     """)
 
@@ -320,8 +325,8 @@ You are the final judge for EPC document title reconciliation.
 
 You will receive:
 - one historical MDR title with normalized metadata
-- a list of 50 candidate RACI documents
-- the decisions of two independent agents (gpt5mini and claude)
+- 50 candidate RACI documents
+- the decisions of two independent agents
 
 Your task:
 Determine the final reconciliation outcome.
@@ -334,42 +339,37 @@ Allowed outcomes:
 Definitions:
 
 MATCH
-Choose MATCH only if there is a single candidate that is clearly the best semantic match to the MDR document.
+Select MATCH only if one candidate is clearly the best semantic match.
 
 NO_MATCH
-Choose NO_MATCH if none of the candidates is a credible match.
+Choose NO_MATCH when none of the candidates is sufficiently credible.
 
 MANUAL_REVIEW
-Choose MANUAL_REVIEW if at least one candidate appears plausible but the evidence is ambiguous, conflicting, or insufficient for a safe automatic match.
+Use MANUAL_REVIEW only when genuine ambiguity exists between plausible candidates or when a plausible candidate cannot be confidently confirmed or rejected.
 
 Core principles:
+- Similarity scores are retrieval hints, not proof of equivalence.
+- Prefer semantic equivalence over lexical overlap.
+- Metadata compatibility is important supporting evidence.
+- Strong metadata incompatibility is negative evidence.
+- Do not overuse MANUAL_REVIEW.
 
-1. Be conservative and precise.
-2. Do not invent information.
-3. Do not rely on external knowledge.
-4. Only select candidates from the provided list.
-5. Similarity score is only a retrieval signal and must not be treated as proof of equivalence.
-6. Prefer semantic equivalence between the MDR title and the candidate description.
-7. Metadata compatibility (discipline, type, category, chapter) is important supporting evidence.
-8. Strong metadata incompatibility is a negative signal.
-9. Generic lexical overlap alone is not sufficient to justify MATCH.
-
-Use prior agent decisions as evidence, not authority.
+Use agent decisions as evidence, not authority.
 
 Decision logic:
 
-1. If both agents selected the same candidate AND the candidate is semantically consistent → MATCH is strongly supported.
+1. If both agents selected the same candidate and the candidate is semantically consistent → MATCH is strongly supported.
 
-2. If the agents disagree:
-   - You may still choose MATCH if one candidate is clearly superior based on semantic meaning and metadata consistency.
+2. If agents selected different candidates:
+   - Choose MATCH only if one candidate is clearly superior.
 
-3. If none of the candidates is credible → choose NO_MATCH.
+3. If neither agent found a credible candidate and the candidates appear weak → choose NO_MATCH.
 
-4. If multiple candidates remain plausible and cannot be safely distinguished → choose MANUAL_REVIEW.
+4. Choose MANUAL_REVIEW only when:
+   - two or more candidates appear genuinely plausible, or
+   - a candidate appears plausible but evidence is insufficient to safely accept or reject it.
 
-Output requirements:
-
-Return JSON only with the following fields:
+Output JSON only with:
 - decision_type
 - selected_titlekey
 - selected_raci_title
@@ -377,16 +377,16 @@ Return JSON only with the following fields:
 - resolution_mode
 - reasoning_summary
 
-resolution_mode (required): choose exactly one of:
-- agent_consensus: both agents selected the same candidate and you confirm it.
-- judge_override: you select one of the two agents' choice or a different candidate from the list.
-- no_credible_candidate: no candidate is plausible (use with NO_MATCH).
-- ambiguous_candidates: plausible candidates exist but are not clearly distinguishable (use with MANUAL_REVIEW).
+Decision logic:
+- If both agents selected the same candidate and the candidate is semantically consistent, MATCH is strongly supported.
+- If agents disagree, choose MATCH only if one candidate is clearly better supported.
+- Choose NO_MATCH when the best available candidate is still weak, generic, metadata-incompatible, or not clearly equivalent.
+- Choose MANUAL_REVIEW only when there is real ambiguity between plausible candidates or a plausible-but-inconclusive candidate that warrants human review.
 
 Rules:
 - confidence must be between 0 and 1
-- reasoning_summary must be concise and factual (maximum 100 words)
-- selected_titlekey and selected_raci_title must be null if decision_type is NO_MATCH or MANUAL_REVIEW
+- selected_titlekey and selected_raci_title must be null for NO_MATCH and MANUAL_REVIEW
+- reasoning_summary maximum 100 words
 """
 
 
@@ -412,9 +412,10 @@ def build_user_prompt(
     blocks.append("- Prefer semantic equivalence between MDR title and candidate meaning")
     blocks.append("- Use discipline, type, category, and chapter as supporting evidence")
     blocks.append("- Strong metadata incompatibility is a negative signal")
-    blocks.append("- Choose MATCH only if a single candidate is clearly the best")
-    blocks.append("- Choose NO_MATCH if none of the candidates is credible")
-    blocks.append("- Choose MANUAL_REVIEW if multiple candidates remain plausible or evidence conflicts")
+    blocks.append("- Choose MATCH only if one candidate is clearly the best")
+    blocks.append("- Choose NO_MATCH if the best candidate is still weak, generic, metadata-incompatible, or not clearly equivalent")
+    blocks.append("- Do not use MANUAL_REVIEW as a default fallback")
+    blocks.append("- Choose MANUAL_REVIEW only when there is genuine ambiguity between plausible candidates or a plausible-but-inconclusive candidate worth human review")
     blocks.append("")
 
     blocks.append("AGENT DECISIONS")
@@ -556,9 +557,11 @@ def save_judge_result(
     con: duckdb.DuckDBPyConnection,
     task: Dict[str, Any],
     model: str,
-    judge_result: Dict[str, Any]
+    judge_result: Dict[str, Any],
+    output_prompt_version: Optional[str] = None,
 ) -> None:
     ts = now_ts_naive_utc()
+    prompt_version_for_save = (output_prompt_version and output_prompt_version.strip()) or task["PromptVersion"]
 
     con.execute("BEGIN;")
     try:
@@ -584,7 +587,7 @@ def save_judge_result(
             JUDGE_AGENT_NAME,
             model,
             task["Document_title"],
-            task["PromptVersion"],
+            prompt_version_for_save,
             task["EmbeddingModel"],
             judge_result["FinalTitleKey"],
             judge_result["FinalRaciTitle"],
@@ -594,17 +597,15 @@ def save_judge_result(
             ts
         ])
 
-        # Save final result
+        # Save final result (PromptVersion in output = versione usata per distinguere i test; non si sovrascrivono righe con versione diversa)
         con.execute(f"""
             INSERT INTO {FINAL_RESULTS_TABLE}
               (TaskId, Document_title, PromptVersion, EmbeddingModel,
                FinalTitleKey, FinalRaciTitle, FinalDecisionType, FinalConfidence,
                ResolutionMode, FinalReason, CreatedAt, UpdatedAt)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (TaskId) DO UPDATE SET
+            ON CONFLICT (TaskId, PromptVersion, EmbeddingModel) DO UPDATE SET
               Document_title = excluded.Document_title,
-              PromptVersion = excluded.PromptVersion,
-              EmbeddingModel = excluded.EmbeddingModel,
               FinalTitleKey = excluded.FinalTitleKey,
               FinalRaciTitle = excluded.FinalRaciTitle,
               FinalDecisionType = excluded.FinalDecisionType,
@@ -615,7 +616,7 @@ def save_judge_result(
         """, [
             task["TaskId"],
             task["Document_title"],
-            task["PromptVersion"],
+            prompt_version_for_save,
             task["EmbeddingModel"],
             judge_result["FinalTitleKey"],
             judge_result["FinalRaciTitle"],
@@ -664,7 +665,8 @@ def mark_judge_error(con: duckdb.DuckDBPyConnection, task_id: str) -> None:
 def process_one_judge_task(
     con: duckdb.DuckDBPyConnection,
     task: Dict[str, Any],
-    model: str
+    model: str,
+    output_prompt_version: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Run judge pipeline for one task (caller must have claimed it). Returns validated_result on success, None on skip/error."""
     candidates = fetch_candidates_for_task(
@@ -693,7 +695,7 @@ def process_one_judge_task(
         agent2=agent2
     )
     validated_result = validate_judge_output(raw_result, candidates)
-    save_judge_result(con=con, task=task, model=model, judge_result=validated_result)
+    save_judge_result(con=con, task=task, model=model, judge_result=validated_result, output_prompt_version=output_prompt_version)
     return validated_result
 
 
@@ -703,6 +705,7 @@ def _worker(
     print_lock: threading.Lock,
     total_tasks: int,
     completed_count: List[int],
+    output_prompt_version: Optional[str] = None,
 ) -> None:
     con = connect_motherduck()
     try:
@@ -718,7 +721,7 @@ def _worker(
                 processed = True
                 with print_lock:
                     print(f"[{threading.current_thread().name}] Processing: {task['Document_title']}")
-                result = process_one_judge_task(con, task, model)
+                result = process_one_judge_task(con, task, model, output_prompt_version=output_prompt_version)
                 if result:
                     with print_lock:
                         print(
@@ -751,11 +754,13 @@ def main():
     ap.add_argument("--embedding-model", default=None, help="EmbeddingModel (default: from config or text-embedding-3-small).")
     ap.add_argument("--limit", type=int, default=None, help="Max number of tasks to process (default: no limit, process all ready).")
     ap.add_argument("--workers", type=int, default=4, help="Number of parallel workers (default: 4).")
+    ap.add_argument("--output-prompt-version", default=None, help="PromptVersion to write in output (default: same as --prompt-version). Set in config as JUDGE_OUTPUT_PROMPT_VERSION.")
     ap.add_argument("--model", default=None, help="OpenAI model for judge (default: gpt-5-mini).")
     args = ap.parse_args()
 
     args.prompt_version = args.prompt_version or _cfg("PROMPT_VERSION", "v1")
     args.embedding_model = args.embedding_model or "text-embedding-3-small"
+    args.output_prompt_version = (args.output_prompt_version or _cfg("JUDGE_OUTPUT_PROMPT_VERSION") or "").strip() or None
     args.model = args.model or DEFAULT_MODEL
 
     con = connect_motherduck()
@@ -768,7 +773,10 @@ def main():
     )
     con.close()
 
-    print(f"Ready tasks fetched for judge: {len(tasks)} (workers={args.workers})")
+    if args.output_prompt_version:
+        print(f"Ready tasks fetched for judge: {len(tasks)} (workers={args.workers}, output PromptVersion={args.output_prompt_version})")
+    else:
+        print(f"Ready tasks fetched for judge: {len(tasks)} (workers={args.workers})")
 
     if not tasks:
         print("Done.")
@@ -784,7 +792,7 @@ def main():
     workers = [
         threading.Thread(
             target=_worker,
-            args=(task_queue, args.model, print_lock, total_tasks, completed_count),
+            args=(task_queue, args.model, print_lock, total_tasks, completed_count, args.output_prompt_version),
             name=f"judge-{i}",
             daemon=True,
         )
