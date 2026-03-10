@@ -2,6 +2,8 @@
 
 import json
 import argparse
+import queue
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -454,11 +456,79 @@ def mark_agent1_error(con: duckdb.DuckDBPyConnection, task_id: str) -> None:
         WHERE TaskId = ?
     """, [ts, task_id])
 
+
+def process_one_agent1_task(
+    con: duckdb.DuckDBPyConnection,
+    task: Dict[str, Any],
+    model: str
+) -> Optional[Dict[str, Any]]:
+    """Run agent1 pipeline for one task (caller must have claimed it). Returns result on success, None on skip/error."""
+    candidates = fetch_candidates_for_task(
+        con=con,
+        document_title=task["Document_title"],
+        prompt_version=task["PromptVersion"],
+        embedding_model=task["EmbeddingModel"]
+    )
+    if not candidates:
+        mark_agent1_error(con, task["TaskId"])
+        return None
+    mdr_ctx = fetch_mdr_context(con, task["Document_title"])
+    raw_result = call_agent(model=model, mdr_ctx=mdr_ctx, candidates=candidates)
+    validated_result = validate_agent_output(raw_result, candidates)
+    save_agent1_evaluation(con=con, task=task, model=model, result=validated_result)
+    return validated_result
+
+
+def _worker(
+    task_queue: queue.Queue,
+    model: str,
+    print_lock: threading.Lock,
+    total_tasks: int,
+    completed_count: List[int],
+) -> None:
+    con = connect_motherduck()
+    try:
+        while True:
+            task = task_queue.get()
+            processed = False
+            try:
+                if task is None:
+                    return
+                claimed = claim_task_agent1(con, task["TaskId"])
+                if not claimed:
+                    continue
+                processed = True
+                with print_lock:
+                    print(f"[{threading.current_thread().name}] Processing: {task['Document_title']}")
+                result = process_one_agent1_task(con, task, model)
+                if result:
+                    with print_lock:
+                        print(
+                            f"  Saved -> decision={result['DecisionType']} "
+                            f"titlekey={result['SelectedTitleKey']} "
+                            f"confidence={result['Confidence']:.3f}"
+                        )
+            except Exception as e:
+                mark_agent1_error(con, task["TaskId"])
+                with print_lock:
+                    print(f"  ERROR: {e}")
+            finally:
+                task_queue.task_done()
+                if task is not None and processed:
+                    with print_lock:
+                        completed_count[0] += 1
+                        n = completed_count[0]
+                        print(f"Progress: {n}/{total_tasks} (remaining: {total_tasks - n})")
+    finally:
+        con.close()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prompt-version", default=None, help="PromptVersion (default: from config.txt PROMPT_VERSION).")
     ap.add_argument("--embedding-model", default=None, help="EmbeddingModel (default: from config.txt EMBEDDING_MODEL).")
     ap.add_argument("--limit", type=int, default=None, help="Max number of tasks to process (default: no limit, process all pending).")
+    ap.add_argument("--workers", type=int, default=4, help="Number of parallel workers (default: 4).")
     ap.add_argument("--model", default=None, help="OpenAI model for agent (default: from config OPENAI_AGENT1_MODEL or gpt-4o-mini).")
     args = ap.parse_args()
 
@@ -466,69 +536,49 @@ def main():
     args.embedding_model = args.embedding_model or "text-embedding-3-small"
     args.model = args.model or DEFAULT_MODEL
 
-    # Nessun --limit = processa tutti i pending; --limit N = al massimo N task
     con = connect_motherduck()
     ensure_agent_eval_table(con)
-
     tasks = fetch_pending_tasks(
         con=con,
         prompt_version=args.prompt_version,
         embedding_model=args.embedding_model,
         limit=args.limit
     )
-
-    print(f"Pending tasks fetched: {len(tasks)}")
-
-    for i, task in enumerate(tasks, start=1):
-        print(f"[{i}/{len(tasks)}] Processing: {task['Document_title']}")
-
-        claimed = claim_task_agent1(con, task["TaskId"])
-        if not claimed:
-            print(f"  Task already claimed/skipped: {task['TaskId']}")
-            continue
-
-        try:
-            candidates = fetch_candidates_for_task(
-                con=con,
-                document_title=task["Document_title"],
-                prompt_version=task["PromptVersion"],
-                embedding_model=task["EmbeddingModel"]
-            )
-
-            if not candidates:
-                print(f"  No candidates found, marking error for task {task['TaskId']}")
-                mark_agent1_error(con, task["TaskId"])
-                continue
-
-            mdr_ctx = fetch_mdr_context(con, task["Document_title"])
-
-            raw_result = call_agent(
-                model=args.model,
-                mdr_ctx=mdr_ctx,
-                candidates=candidates
-            )
-
-            validated_result = validate_agent_output(raw_result, candidates)
-
-            save_agent1_evaluation(
-                con=con,
-                task=task,
-                model=args.model,
-                result=validated_result
-            )
-
-            print(
-                f"  Saved -> decision={validated_result['DecisionType']} "
-                f"titlekey={validated_result['SelectedTitleKey']} "
-                f"confidence={validated_result['Confidence']:.3f}"
-            )
-
-        except Exception as e:
-            print(f"  ERROR: {e}")
-            mark_agent1_error(con, task["TaskId"])
-
     con.close()
-    print("Done.")
+
+    print(f"Pending tasks fetched: {len(tasks)} (workers={args.workers})")
+
+    if not tasks:
+        print("Done.")
+        return
+
+    total_tasks = len(tasks)
+    task_queue: queue.Queue = queue.Queue()
+    for task in tasks:
+        task_queue.put(task)
+    print_lock = threading.Lock()
+    completed_count: List[int] = [0]
+
+    workers = [
+        threading.Thread(
+            target=_worker,
+            args=(task_queue, args.model, print_lock, total_tasks, completed_count),
+            name=f"agent1-{i}",
+            daemon=True,
+        )
+        for i in range(args.workers)
+    ]
+    for t in workers:
+        t.start()
+    for _ in range(args.workers):
+        task_queue.put(None)
+    try:
+        task_queue.join()
+        for t in workers:
+            t.join()
+        print("Done.")
+    except KeyboardInterrupt:
+        print("\nInterrupted (Ctrl+C). Exiting...")
 
 
 if __name__ == "__main__":

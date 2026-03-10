@@ -2,6 +2,8 @@
 
 import json
 import argparse
+import queue
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -587,6 +589,87 @@ def mark_judge_error(con: duckdb.DuckDBPyConnection, task_id: str) -> None:
     """, [ts, task_id])
 
 
+def process_one_judge_task(
+    con: duckdb.DuckDBPyConnection,
+    task: Dict[str, Any],
+    model: str
+) -> Optional[Dict[str, Any]]:
+    """Run judge pipeline for one task (caller must have claimed it). Returns validated_result on success, None on skip/error."""
+    candidates = fetch_candidates_for_task(
+        con=con,
+        document_title=task["Document_title"],
+        prompt_version=task["PromptVersion"],
+        embedding_model=task["EmbeddingModel"]
+    )
+    if not candidates:
+        mark_judge_error(con, task["TaskId"])
+        return None
+
+    decisions = fetch_agent_decisions(con, task["TaskId"])
+    agent1 = decisions.get("gpt5mini")
+    agent2 = decisions.get("claude")
+    if not agent1 or not agent2:
+        mark_judge_error(con, task["TaskId"])
+        return None
+
+    mdr_ctx = fetch_mdr_context(con, task["Document_title"])
+    raw_result = call_judge(
+        model=model,
+        mdr_ctx=mdr_ctx,
+        candidates=candidates,
+        agent1=agent1,
+        agent2=agent2
+    )
+    validated_result = validate_judge_output(raw_result, candidates)
+    save_judge_result(con=con, task=task, model=model, judge_result=validated_result)
+    return validated_result
+
+
+def _worker(
+    task_queue: queue.Queue,
+    model: str,
+    print_lock: threading.Lock,
+    total_tasks: int,
+    completed_count: List[int],
+) -> None:
+    con = connect_motherduck()
+    try:
+        while True:
+            task = task_queue.get()
+            processed = False
+            try:
+                if task is None:
+                    return
+                claimed = claim_task_judge(con, task["TaskId"])
+                if not claimed:
+                    continue
+                processed = True
+                with print_lock:
+                    print(f"[{threading.current_thread().name}] Processing: {task['Document_title']}")
+                result = process_one_judge_task(con, task, model)
+                if result:
+                    with print_lock:
+                        print(
+                            f"  Saved -> final_decision={result['FinalDecisionType']} "
+                            f"titlekey={result['FinalTitleKey']} "
+                            f"confidence={result['FinalConfidence']:.3f} "
+                            f"mode={result['ResolutionMode']}"
+                        )
+            except Exception as e:
+                mark_judge_error(con, task["TaskId"])
+                with print_lock:
+                    print(f"  ERROR: {e}")
+            finally:
+                task_queue.task_done()
+                if task is not None and processed:
+                    with print_lock:
+                        completed_count[0] += 1
+                        n = completed_count[0]
+                        print(f"Progress: {n}/{total_tasks} (remaining: {total_tasks - n})")
+    finally:
+        con.close()
+
+
 # --------------------------------------------------
 # Main
 # --------------------------------------------------
@@ -595,6 +678,7 @@ def main():
     ap.add_argument("--prompt-version", default=None, help="PromptVersion (default: from config.txt PROMPT_VERSION).")
     ap.add_argument("--embedding-model", default=None, help="EmbeddingModel (default: from config or text-embedding-3-small).")
     ap.add_argument("--limit", type=int, default=None, help="Max number of tasks to process (default: no limit, process all ready).")
+    ap.add_argument("--workers", type=int, default=4, help="Number of parallel workers (default: 4).")
     ap.add_argument("--model", default=None, help="OpenAI model for judge (default: gpt-5-mini).")
     args = ap.parse_args()
 
@@ -604,78 +688,47 @@ def main():
 
     con = connect_motherduck()
     ensure_final_results_table(con)
-
     tasks = fetch_ready_tasks(
         con=con,
         prompt_version=args.prompt_version,
         embedding_model=args.embedding_model,
         limit=args.limit
     )
-
-    print(f"Ready tasks fetched for judge: {len(tasks)}")
-
-    for i, task in enumerate(tasks, start=1):
-        print(f"[{i}/{len(tasks)}] Processing: {task['Document_title']}")
-
-        claimed = claim_task_judge(con, task["TaskId"])
-        if not claimed:
-            print(f"  Task already claimed/skipped: {task['TaskId']}")
-            continue
-
-        try:
-            candidates = fetch_candidates_for_task(
-                con=con,
-                document_title=task["Document_title"],
-                prompt_version=task["PromptVersion"],
-                embedding_model=task["EmbeddingModel"]
-            )
-
-            if not candidates:
-                print(f"  No candidates found, marking judge error for task {task['TaskId']}")
-                mark_judge_error(con, task["TaskId"])
-                continue
-
-            decisions = fetch_agent_decisions(con, task["TaskId"])
-            agent1 = decisions.get("gpt5mini")
-            agent2 = decisions.get("claude")
-
-            if not agent1 or not agent2:
-                print(f"  Missing prior agent decisions, marking judge error for task {task['TaskId']}")
-                mark_judge_error(con, task["TaskId"])
-                continue
-
-            mdr_ctx = fetch_mdr_context(con, task["Document_title"])
-
-            raw_result = call_judge(
-                model=args.model,
-                mdr_ctx=mdr_ctx,
-                candidates=candidates,
-                agent1=agent1,
-                agent2=agent2
-            )
-
-            validated_result = validate_judge_output(raw_result, candidates)
-
-            save_judge_result(
-                con=con,
-                task=task,
-                model=args.model,
-                judge_result=validated_result
-            )
-
-            print(
-                f"  Saved -> final_decision={validated_result['FinalDecisionType']} "
-                f"titlekey={validated_result['FinalTitleKey']} "
-                f"confidence={validated_result['FinalConfidence']:.3f} "
-                f"mode={validated_result['ResolutionMode']}"
-            )
-
-        except Exception as e:
-            print(f"  ERROR: {e}")
-            mark_judge_error(con, task["TaskId"])
-
     con.close()
-    print("Done.")
+
+    print(f"Ready tasks fetched for judge: {len(tasks)} (workers={args.workers})")
+
+    if not tasks:
+        print("Done.")
+        return
+
+    total_tasks = len(tasks)
+    task_queue: queue.Queue = queue.Queue()
+    for task in tasks:
+        task_queue.put(task)
+    print_lock = threading.Lock()
+    completed_count: List[int] = [0]
+
+    workers = [
+        threading.Thread(
+            target=_worker,
+            args=(task_queue, args.model, print_lock, total_tasks, completed_count),
+            name=f"judge-{i}",
+            daemon=True,
+        )
+        for i in range(args.workers)
+    ]
+    for t in workers:
+        t.start()
+    for _ in range(args.workers):
+        task_queue.put(None)
+    try:
+        task_queue.join()
+        for t in workers:
+            t.join()
+        print("Done.")
+    except KeyboardInterrupt:
+        print("\nInterrupted (Ctrl+C). Exiting...")
 
 
 if __name__ == "__main__":
