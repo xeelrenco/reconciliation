@@ -1,4 +1,22 @@
 #!/usr/bin/env python3
+"""
+Agent 2 (Claude) per riconciliazione MDR: valida i candidati RACI per ogni task e scrive
+le decisioni in MdrReconciliationAgentDecisions.
+
+Config: config.txt (MOTHERDUCK_*, ANTHROPIC_API_KEY, PROMPT_VERSION). Vedi config.example.txt.
+
+Uso in tempo reale (default)
+  Elabora i task pending con N worker paralleli (possibile rate limit 429).
+  python 3.2_run_agent2_claude.py [--prompt-version v1] [--embedding-model text-embedding-3-small] [--limit N] [--workers 4] [--model claude-sonnet-4-6]
+
+Uso con Batch API (niente rate limit, ~50% costo)
+  1) Submit: invia i task pending in un unico batch (elaborazione asincrona, di solito < 1h).
+     python 3.2_run_agent2_claude.py --batch [--limit N]
+     L'id del batch viene salvato in .agent2_last_batch_id.
+  2) Collect: quando il batch è terminato, scarica i risultati e scrive in DB.
+     python 3.2_run_agent2_claude.py --batch-collect
+     Oppure: python 3.2_run_agent2_claude.py --batch-collect --batch-id <id>
+"""
 
 import json
 import argparse
@@ -16,6 +34,7 @@ import anthropic
 # Config da file (stesso formato degli altri script)
 # -----------------------------
 CONFIG_PATH = Path(__file__).resolve().parent / "config.txt"
+BATCH_ID_FILE = Path(__file__).resolve().parent / ".agent2_last_batch_id"
 
 
 def load_config(path: Optional[Path] = None) -> Dict[str, str]:
@@ -501,6 +520,133 @@ def mark_agent2_error(con: duckdb.DuckDBPyConnection, task_id: str) -> None:
     """, [ts, task_id])
 
 
+def _extract_text_from_batch_message(message: Any) -> str:
+    """Extract plain text from batch result message (object or dict)."""
+    content = getattr(message, "content", None) or (message.get("content") if isinstance(message, dict) else [])
+    parts = []
+    for block in content or []:
+        if isinstance(block, dict):
+            if block.get("type") == "text":
+                parts.append(block.get("text") or "")
+        elif getattr(block, "type", None) == "text":
+            parts.append(getattr(block, "text", "") or "")
+    return "".join(parts).strip()
+
+
+def run_batch_submit(
+    con: duckdb.DuckDBPyConnection,
+    tasks: List[Dict[str, Any]],
+    model: str,
+) -> str:
+    """Build batch requests, create batch, mark tasks as running, save batch id. Returns batch id."""
+    requests: List[Dict[str, Any]] = []
+    submitted_task_ids: List[str] = []
+    for task in tasks:
+        candidates = fetch_candidates_for_task(
+            con=con,
+            document_title=task["Document_title"],
+            prompt_version=task["PromptVersion"],
+            embedding_model=task["EmbeddingModel"],
+        )
+        if not candidates:
+            continue
+        mdr_ctx = fetch_mdr_context(con, task["Document_title"])
+        user_prompt = build_user_prompt(mdr_ctx, candidates)
+        requests.append({
+            "custom_id": task["TaskId"],
+            "params": {
+                "model": model,
+                "max_tokens": 600,
+                "system": SYSTEM_PROMPT,
+                "messages": [{"role": "user", "content": user_prompt}],
+            },
+        })
+        submitted_task_ids.append(task["TaskId"])
+    if not requests:
+        raise RuntimeError("No valid tasks to submit (all missing candidates?).")
+    batch = client.beta.messages.batches.create(requests=requests)
+    batch_id = batch.id
+    ts = now_ts_naive_utc()
+    for task_id in submitted_task_ids:
+        con.execute("""
+            UPDATE my_db.mdr_reconciliation.MdrReconciliationTasks
+            SET Agent2Status = 'running',
+                FinalStatus = CASE WHEN FinalStatus = 'pending' THEN 'in_progress' ELSE FinalStatus END,
+                UpdatedAt = ?
+            WHERE TaskId = ?
+        """, [ts, task_id])
+    BATCH_ID_FILE.write_text(batch_id, encoding="utf-8")
+    return batch_id
+
+
+def run_batch_collect(
+    con: duckdb.DuckDBPyConnection,
+    batch_id: str,
+    model: str,
+    poll_interval: int = 60,
+) -> None:
+    """Poll batch until ended, then stream results and write each to DB."""
+    while True:
+        batch = client.beta.messages.batches.retrieve(message_batch_id=batch_id)
+        status = getattr(batch, "processing_status", None) or (batch.get("processing_status") if isinstance(batch, dict) else None)
+        if status == "ended":
+            break
+        print(f"Batch {batch_id} still processing (status={status}), waiting {poll_interval}s...")
+        time.sleep(poll_interval)
+    saved = 0
+    errors = 0
+    for item in client.beta.messages.batches.results(message_batch_id=batch_id):
+        custom_id = getattr(item, "custom_id", None) or (item.get("custom_id") if isinstance(item, dict) else None)
+        result = getattr(item, "result", None) or (item.get("result") if isinstance(item, dict) else None)
+        if not custom_id or not result:
+            continue
+        task_id = str(custom_id)
+        result_type = getattr(result, "type", None) or (result.get("type") if isinstance(result, dict) else None)
+        if result_type == "succeeded":
+            msg = getattr(result, "message", None) or (result.get("message") if isinstance(result, dict) else None)
+            if not msg:
+                mark_agent2_error(con, task_id)
+                errors += 1
+                continue
+            raw_text = _extract_text_from_batch_message(msg)
+            try:
+                cleaned = extract_json_payload(raw_text)
+                raw_result = json.loads(cleaned)
+            except (json.JSONDecodeError, ValueError) as e:
+                mark_agent2_error(con, task_id)
+                errors += 1
+                print(f"  {task_id}: parse error {e}")
+                continue
+            row = con.execute("""
+                SELECT TaskId, Document_title, PromptVersion, EmbeddingModel
+                FROM my_db.mdr_reconciliation.MdrReconciliationTasks
+                WHERE TaskId = ?
+            """, [task_id]).fetchone()
+            if not row:
+                errors += 1
+                continue
+            task = {"TaskId": row[0], "Document_title": row[1], "PromptVersion": row[2], "EmbeddingModel": row[3]}
+            candidates = fetch_candidates_for_task(con, task["Document_title"], task["PromptVersion"], task["EmbeddingModel"])
+            if not candidates:
+                mark_agent2_error(con, task_id)
+                errors += 1
+                continue
+            try:
+                validated = validate_agent_output(raw_result, candidates)
+                save_agent2_evaluation(con=con, task=task, model=model, result=validated)
+                saved += 1
+                print(f"  {task_id} -> {validated['DecisionType']} (saved)")
+            except Exception as e:
+                mark_agent2_error(con, task_id)
+                errors += 1
+                print(f"  {task_id}: validation/save error {e}")
+        else:
+            mark_agent2_error(con, task_id)
+            errors += 1
+            print(f"  {task_id}: result type={result_type}")
+    print(f"Batch collect done: {saved} saved, {errors} errors.")
+
+
 def process_one_agent2_task(
     con: duckdb.DuckDBPyConnection,
     task: Dict[str, Any],
@@ -574,6 +720,9 @@ def main():
     ap.add_argument("--limit", type=int, default=None, help="Max number of tasks to process (default: no limit, process all pending).")
     ap.add_argument("--workers", type=int, default=4, help="Number of parallel workers (default: 4).")
     ap.add_argument("--model", default=None, help="Anthropic model for agent (default: claude-sonnet-4-6).")
+    ap.add_argument("--batch", action="store_true", help="Use Batch API: submit pending tasks and exit (no rate limit; collect later with --batch-collect).")
+    ap.add_argument("--batch-collect", action="store_true", help="Poll batch until ended and write results to DB. Use --batch-id or last batch from .agent2_last_batch_id.")
+    ap.add_argument("--batch-id", default=None, help="Batch ID for --batch-collect (default: read from .agent2_last_batch_id).")
     args = ap.parse_args()
 
     args.prompt_version = args.prompt_version or _cfg("PROMPT_VERSION", "v1")
@@ -582,6 +731,35 @@ def main():
 
     con = connect_motherduck()
     ensure_agent_eval_table(con)
+
+    if args.batch_collect:
+        batch_id = (args.batch_id or "").strip() or (BATCH_ID_FILE.read_text(encoding="utf-8").strip() if BATCH_ID_FILE.exists() else "")
+        if not batch_id:
+            print("Error: no --batch-id and no .agent2_last_batch_id file.")
+            con.close()
+            return
+        print(f"Collecting results for batch: {batch_id}")
+        run_batch_collect(con=con, batch_id=batch_id, model=args.model)
+        con.close()
+        return
+
+    if args.batch:
+        tasks = fetch_pending_tasks(
+            con=con,
+            prompt_version=args.prompt_version,
+            embedding_model=args.embedding_model,
+            limit=args.limit,
+        )
+        if not tasks:
+            print("No pending tasks for batch.")
+            con.close()
+            return
+        batch_id = run_batch_submit(con=con, tasks=tasks, model=args.model)
+        con.close()
+        print(f"Batch submitted: {batch_id}")
+        print("Run with --batch-collect later to write results to DB (or use --batch-id if you save it).")
+        return
+
     tasks = fetch_pending_tasks(
         con=con,
         prompt_version=args.prompt_version,
