@@ -16,6 +16,9 @@ Uso con Batch API (niente rate limit, ~50% costo)
   2) Collect: quando il batch è terminato, scarica i risultati e scrive in DB.
      python 3.2_run_agent2_claude.py --batch-collect
      Oppure: python 3.2_run_agent2_claude.py --batch-collect --batch-id <id>
+
+Stati Agent2Status (batch): pending | submitted_{batch_id} | in_batch_{batch_id} | done | error_{batch_id}
+  (solo 'done' senza suffisso; gli altri stati batch hanno _batch_id per tracciare il batch.)
 """
 
 import json
@@ -508,16 +511,22 @@ def save_agent2_evaluation(
         con.execute("ROLLBACK;")
         raise
 
-def mark_agent2_error(con: duckdb.DuckDBPyConnection, task_id: str) -> None:
+def mark_agent2_error(
+    con: duckdb.DuckDBPyConnection,
+    task_id: str,
+    batch_id: Optional[str] = None,
+) -> None:
+    """Set Agent2Status to 'error' or 'error_{batch_id}' and FinalStatus to 'error'."""
     ts = now_ts_naive_utc()
+    status = f"error_{batch_id}" if batch_id else "error"
     con.execute("""
         UPDATE my_db.mdr_reconciliation.MdrReconciliationTasks
         SET
-          Agent2Status = 'error',
+          Agent2Status = ?,
           FinalStatus = 'error',
           UpdatedAt = ?
         WHERE TaskId = ?
-    """, [ts, task_id])
+    """, [status, ts, task_id])
 
 
 def _extract_text_from_batch_message(message: Any) -> str:
@@ -567,14 +576,16 @@ def run_batch_submit(
     batch = client.beta.messages.batches.create(requests=requests)
     batch_id = batch.id
     ts = now_ts_naive_utc()
+    # Batch status: submitted_{batch_id} = task inviato in questo batch (poi done o error_{batch_id})
+    status_submitted = f"submitted_{batch_id}"
     for task_id in submitted_task_ids:
         con.execute("""
             UPDATE my_db.mdr_reconciliation.MdrReconciliationTasks
-            SET Agent2Status = 'running',
+            SET Agent2Status = ?,
                 FinalStatus = CASE WHEN FinalStatus = 'pending' THEN 'in_progress' ELSE FinalStatus END,
                 UpdatedAt = ?
             WHERE TaskId = ?
-        """, [ts, task_id])
+        """, [status_submitted, ts, task_id])
     BATCH_ID_FILE.write_text(batch_id, encoding="utf-8")
     return batch_id
 
@@ -593,6 +604,14 @@ def run_batch_collect(
             break
         print(f"Batch {batch_id} still processing (status={status}), waiting {poll_interval}s...")
         time.sleep(poll_interval)
+    # Passaggio submitted_{id} -> in_batch_{id} (batch terminato, in scrittura risultati)
+    status_submitted = f"submitted_{batch_id}"
+    status_in_batch = f"in_batch_{batch_id}"
+    con.execute("""
+        UPDATE my_db.mdr_reconciliation.MdrReconciliationTasks
+        SET Agent2Status = ?, UpdatedAt = ?
+        WHERE Agent2Status = ?
+    """, [status_in_batch, now_ts_naive_utc(), status_submitted])
     saved = 0
     errors = 0
     for item in client.beta.messages.batches.results(message_batch_id=batch_id):
@@ -605,7 +624,7 @@ def run_batch_collect(
         if result_type == "succeeded":
             msg = getattr(result, "message", None) or (result.get("message") if isinstance(result, dict) else None)
             if not msg:
-                mark_agent2_error(con, task_id)
+                mark_agent2_error(con, task_id, batch_id=batch_id)
                 errors += 1
                 continue
             raw_text = _extract_text_from_batch_message(msg)
@@ -613,7 +632,7 @@ def run_batch_collect(
                 cleaned = extract_json_payload(raw_text)
                 raw_result = json.loads(cleaned)
             except (json.JSONDecodeError, ValueError) as e:
-                mark_agent2_error(con, task_id)
+                mark_agent2_error(con, task_id, batch_id=batch_id)
                 errors += 1
                 print(f"  {task_id}: parse error {e}")
                 continue
@@ -628,7 +647,7 @@ def run_batch_collect(
             task = {"TaskId": row[0], "Document_title": row[1], "PromptVersion": row[2], "EmbeddingModel": row[3]}
             candidates = fetch_candidates_for_task(con, task["Document_title"], task["PromptVersion"], task["EmbeddingModel"])
             if not candidates:
-                mark_agent2_error(con, task_id)
+                mark_agent2_error(con, task_id, batch_id=batch_id)
                 errors += 1
                 continue
             try:
@@ -637,11 +656,11 @@ def run_batch_collect(
                 saved += 1
                 print(f"  {task_id} -> {validated['DecisionType']} (saved)")
             except Exception as e:
-                mark_agent2_error(con, task_id)
+                mark_agent2_error(con, task_id, batch_id=batch_id)
                 errors += 1
                 print(f"  {task_id}: validation/save error {e}")
         else:
-            mark_agent2_error(con, task_id)
+            mark_agent2_error(con, task_id, batch_id=batch_id)
             errors += 1
             print(f"  {task_id}: result type={result_type}")
     print(f"Batch collect done: {saved} saved, {errors} errors.")
