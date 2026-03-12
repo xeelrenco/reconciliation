@@ -10,7 +10,7 @@ Behavior:
 - Resolves Title -> TitleKey via raci_matrix.Documents
 - Ensures a row exists in mdr_reconciliation.DocumentTitleDescriptions for (TitleKey, PromptVersion)
 - Updates ONLY ManualDescription (AI Description remains untouched)
-- Optionally sets Status='approved' (default: yes)
+- Optionally sets Status='manual_written' (default: yes) to distinguish hand-written from AI-generated
 
 Requirements:
   pip install duckdb pandas openpyxl
@@ -135,7 +135,7 @@ def main():
     ap.add_argument("--excel", required=True, help="Path to Excel (A=Title, B=ManualDescription).")
     ap.add_argument("--prompt-version", default=None, help="PromptVersion to target (default: from config.txt PROMPT_VERSION).")
     ap.add_argument("--dry-run", action="store_true", help="If set, do not write changes; only report.")
-    ap.add_argument("--no-approve", action="store_true", help="If set, do NOT change Status to 'approved'.")
+    ap.add_argument("--no-approve", action="store_true", help="If set, do NOT change Status to 'manual_written'.")
     args = ap.parse_args()
 
     prompt_version = args.prompt_version or _cfg("PROMPT_VERSION", "v1")
@@ -208,7 +208,7 @@ def main():
               NULL AS KeywordsJson,
               NULL AS Scope,
               NULL AS Exclusions,
-              'generated' AS Status,
+              'manual_written' AS Status,
               NULL AS Error,
               ? AS CreatedAt,
               ? AS UpdatedAt,
@@ -235,7 +235,7 @@ def main():
                 UPDATE mdr_reconciliation.DocumentTitleDescriptions t
                 SET
                   ManualDescription = o.ManualDescription,
-                  Status = 'approved',
+                  Status = 'manual_written',
                   UpdatedAt = ?
                 FROM tmp_ok o
                 WHERE t.TitleKey = o.TitleKey

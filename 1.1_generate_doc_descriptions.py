@@ -222,7 +222,8 @@ def ensure_table(con: duckdb.DuckDBPyConnection) -> None:
 
 def fetch_pending(con: duckdb.DuckDBPyConnection, limit: int) -> List[Dict[str, Any]]:
     """
-    Pull records that do not yet have generated/reviewed/approved for this version.
+    Pull records that do not yet have a valid description (Status in 'generated' or 'manual_written') for this version.
+    Both generated (AI) and manual_written are considered valid; the status only distinguishes the source.
     Reads from the enriched view (human-friendly values).
     """
     q = f"""
@@ -238,7 +239,7 @@ def fetch_pending(con: duckdb.DuckDBPyConnection, limit: int) -> List[Dict[str, 
     LEFT JOIN mdr_reconciliation.DocumentTitleDescriptions t
       ON t.TitleKey = e.TitleKey
      AND t.PromptVersion = ?
-     AND t.Status IN ('generated','reviewed','approved')
+     AND t.Status IN ('generated', 'manual_written')
     WHERE t.TitleKey IS NULL
     ORDER BY e.TitleKey
     LIMIT {limit}
