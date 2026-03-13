@@ -70,7 +70,7 @@ def _cfg(key: str, default: Optional[str] = None) -> str:
 
 
 AGENT_NAME = "claude"
-DEFAULT_MODEL = "claude-sonnet-4-6"
+DEFAULT_MODEL = "claude-opus-4-6"
 
 client = anthropic.Anthropic(api_key=_cfg("ANTHROPIC_API_KEY") or None)
 
@@ -93,6 +93,9 @@ def connect_motherduck() -> duckdb.DuckDBPyConnection:
     return duckdb.connect(f"md:{dbname}?token={token}")
 
 
+AGENT_TOP_CANDIDATES_TABLE = "my_db.mdr_reconciliation.MdrReconciliationAgentTopCandidates"
+
+
 def ensure_agent_eval_table(con: duckdb.DuckDBPyConnection) -> None:
     con.execute("""
     CREATE TABLE IF NOT EXISTS my_db.mdr_reconciliation.MdrReconciliationAgentDecisions (
@@ -109,6 +112,24 @@ def ensure_agent_eval_table(con: duckdb.DuckDBPyConnection) -> None:
       ReasoningSummary    VARCHAR NOT NULL,
       CreatedAt           TIMESTAMP NOT NULL,
       PRIMARY KEY (TaskId, AgentName)
+    );
+    """)
+
+
+def ensure_agent_top_candidates_table(con: duckdb.DuckDBPyConnection) -> None:
+    con.execute(f"""
+    CREATE TABLE IF NOT EXISTS {AGENT_TOP_CANDIDATES_TABLE} (
+      TaskId                    VARCHAR NOT NULL,
+      AgentName                 VARCHAR NOT NULL,
+      PromptVersion             VARCHAR NOT NULL,
+      ModelName                 VARCHAR,
+      CandidateRankWithinAgent  INTEGER NOT NULL,
+      TitleKey                  VARCHAR NOT NULL,
+      RaciTitle                 VARCHAR,
+      CandidateConfidence       DOUBLE,
+      WhyPlausible              VARCHAR,
+      CreatedAt                 TIMESTAMP NOT NULL,
+      PRIMARY KEY (TaskId, AgentName, CandidateRankWithinAgent)
     );
     """)
 
@@ -240,6 +261,16 @@ def fetch_mdr_context(
     return dict(zip(cols, row))
 
 
+# Expected JSON shape (for validation; Claude does not use schema in API)
+EXPECTED_AGENT_OUTPUT = {
+    "decision_type": "MATCH | NO_MATCH",
+    "selected_titlekey": "string | null",
+    "selected_raci_title": "string | null",
+    "confidence": 0.0,
+    "reasoning_summary": "string",
+    "top_candidates": [{"rank": 1, "titlekey": "string", "raci_title": "string", "confidence": 0.0, "why_plausible": "string"}],
+}
+
 SYSTEM_PROMPT = """
 You are a specialist agent for document title reconciliation in EPC project documentation.
 
@@ -248,48 +279,25 @@ You will receive:
 - a list of 50 candidate standard RACI documents
 
 Your task:
-Determine whether one candidate is a sufficiently credible semantic match.
+1. Determine whether a sufficiently credible semantic match exists.
+2. Return MATCH or NO_MATCH.
+3. Return an ordered shortlist (top_candidates) of up to 3 most plausible candidates.
 
 Allowed outcomes:
-- MATCH
-- NO_MATCH
-
-Definitions:
-
-MATCH
-Choose MATCH only if one candidate is clearly the best semantic match to the MDR record.
-
-NO_MATCH
-Choose NO_MATCH if no candidate is sufficiently credible based on semantic meaning and metadata consistency.
-
-Core principles:
-- Only select from the provided candidates.
-- Do not invent missing information.
-- Do not use external knowledge.
-- Similarity score and rank are retrieval hints, not proof of equivalence.
-- Prefer semantic equivalence over lexical overlap.
-- Use MDR metadata (discipline, document type) as context.
-- Use candidate title, description, discipline, type, category, and chapter as supporting evidence.
-- Strong metadata incompatibility is negative evidence.
-- Generic wording overlap alone is not sufficient for MATCH.
-
-Decision rules:
-- Return MATCH only when one candidate is clearly stronger than the others.
-- If multiple candidates appear plausible but none is clearly superior, return NO_MATCH.
-- If the best candidate is still weak, generic, or not clearly equivalent, return NO_MATCH.
-
-Output format:
-Return JSON only with:
-- decision_type
-- selected_titlekey
-- selected_raci_title
-- confidence
-- reasoning_summary
+- MATCH: exactly one candidate is clearly the best semantic match.
+- NO_MATCH: no candidate is sufficiently credible.
 
 Rules:
-- confidence must be between 0 and 1
-- selected_titlekey and selected_raci_title must be null when decision_type is NO_MATCH
-- reasoning_summary must be concise and factual (maximum 80 words)
+- MATCH only if one candidate is clearly the best. If several are plausible but none is clearly superior, return NO_MATCH.
+- Similarity score and rank are retrieval hints only, not proof of equivalence.
+- Prefer semantic equivalence over lexical overlap. Use discipline, type, category, chapter as strong evidence; strong metadata incompatibility is negative evidence.
+- Do not invent information; only use provided candidates.
+- top_candidates: maximum 3 distinct candidates, ordered by your preference (rank 1 = best). Ranks must be 1, 2, 3 with no gaps. No duplicates.
+- If decision_type is MATCH: selected_titlekey and selected_raci_title must equal the rank-1 candidate in top_candidates (same titlekey and raci_title).
+- If decision_type is NO_MATCH: selected_titlekey and selected_raci_title must be null. top_candidates may be empty or list up to 3 closest-but-insufficient candidates.
+- confidence between 0 and 1. reasoning_summary and why_plausible must be brief and factual.
+
+Output JSON only with: decision_type, selected_titlekey, selected_raci_title, confidence, reasoning_summary, top_candidates (array of {rank, titlekey, raci_title, confidence, why_plausible}).
 """
 
 
@@ -383,7 +391,8 @@ def call_agent(model: str, mdr_ctx: Dict[str, Any], candidates: List[Dict[str, A
         try:
             message = client.messages.create(
                 model=model,
-                max_tokens=600,
+                # token budget aumentato per permettere risposte JSON complete
+                max_tokens=1200,
                 system=SYSTEM_PROMPT,
                 messages=[
                     {
@@ -402,22 +411,54 @@ def call_agent(model: str, mdr_ctx: Dict[str, Any], candidates: List[Dict[str, A
 
     raw_text = extract_text_from_anthropic_message(message)
     cleaned_json = extract_json_payload(raw_text)
-    return json.loads(cleaned_json)
+    try:
+        return json.loads(cleaned_json)
+    except json.JSONDecodeError as e:
+        # Log raw Anthropic output to help debug JSON formatting issues
+        print("==== CLAUDE RAW TEXT BEGIN ====")
+        print(raw_text)
+        print("==== CLAUDE RAW TEXT END ====")
+        print("==== CLAUDE CLEANED JSON BEGIN ====")
+        print(cleaned_json)
+        print("==== CLAUDE CLEANED JSON END ====")
+        raise
 
 
 def validate_agent_output(result: Dict[str, Any], candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
     candidate_map = {norm(c["TitleKey"]): c for c in candidates}
 
     decision_type = result["decision_type"]
-    selected_titlekey = result["selected_titlekey"]
-    selected_raci_title = result["selected_raci_title"]
+    selected_titlekey = result.get("selected_titlekey")
+    selected_raci_title = result.get("selected_raci_title")
     confidence = float(result["confidence"])
-    reasoning_summary = norm(result["reasoning_summary"])
+    reasoning_summary = norm(result.get("reasoning_summary") or "")
+    raw_top = result.get("top_candidates") or []
 
     if confidence < 0:
         confidence = 0.0
     if confidence > 1:
         confidence = 1.0
+
+    # Validate top_candidates: max 3, distinct titlekeys, ranks 1..N no gaps
+    top_candidates: List[Dict[str, Any]] = []
+    seen_keys: set = set()
+    for i, item in enumerate(raw_top[:3]):
+        rank = int(item.get("rank", i + 1))
+        titlekey = norm(item.get("titlekey") or "")
+        if not titlekey or titlekey in seen_keys:
+            raise ValueError("top_candidates must contain distinct titlekeys; rank must be 1..N without gaps")
+        seen_keys.add(titlekey)
+        if titlekey not in candidate_map:
+            raise ValueError(f"top_candidates titlekey not in provided candidates: {titlekey}")
+        if rank != i + 1:
+            raise ValueError("top_candidates ranks must be 1, 2, 3 with no gaps")
+        top_candidates.append({
+            "CandidateRankWithinAgent": rank,
+            "TitleKey": titlekey,
+            "RaciTitle": norm(item.get("raci_title") or candidate_map[titlekey]["RaciTitle"]),
+            "CandidateConfidence": max(0.0, min(1.0, float(item.get("confidence", 0)))),
+            "WhyPlausible": norm(item.get("why_plausible") or ""),
+        })
 
     if decision_type == "NO_MATCH":
         return {
@@ -425,7 +466,8 @@ def validate_agent_output(result: Dict[str, Any], candidates: List[Dict[str, Any
             "SelectedTitleKey": None,
             "SelectedRaciTitle": None,
             "Confidence": confidence,
-            "ReasoningSummary": reasoning_summary or "No credible match among the provided candidates."
+            "ReasoningSummary": reasoning_summary or "No credible match among the provided candidates.",
+            "TopCandidates": top_candidates,
         }
 
     if decision_type != "MATCH":
@@ -444,12 +486,17 @@ def validate_agent_output(result: Dict[str, Any], candidates: List[Dict[str, Any
     if not selected_raci_title:
         selected_raci_title = norm(candidate["RaciTitle"])
 
+    # MATCH: must have at least one top_candidate and rank 1 must equal selected_titlekey
+    if not top_candidates or norm(top_candidates[0]["TitleKey"]) != selected_titlekey:
+        raise ValueError("When MATCH, top_candidates must contain selected_titlekey as rank 1")
+
     return {
         "DecisionType": "MATCH",
         "SelectedTitleKey": selected_titlekey,
         "SelectedRaciTitle": norm(selected_raci_title),
         "Confidence": confidence,
-        "ReasoningSummary": reasoning_summary or "Selected best semantic match among provided candidates."
+        "ReasoningSummary": reasoning_summary or "Selected best semantic match among provided candidates.",
+        "TopCandidates": top_candidates,
     }
 
 
@@ -493,6 +540,30 @@ def save_agent2_evaluation(
             result["ReasoningSummary"],
             ts
         ])
+
+        # Write top_candidates to MdrReconciliationAgentTopCandidates
+        con.execute(f"""
+            DELETE FROM {AGENT_TOP_CANDIDATES_TABLE}
+            WHERE TaskId = ? AND AgentName = ?
+        """, [task["TaskId"], AGENT_NAME])
+        for tc in result.get("TopCandidates") or []:
+            con.execute(f"""
+                INSERT INTO {AGENT_TOP_CANDIDATES_TABLE}
+                  (TaskId, AgentName, PromptVersion, ModelName, CandidateRankWithinAgent,
+                   TitleKey, RaciTitle, CandidateConfidence, WhyPlausible, CreatedAt)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, [
+                task["TaskId"],
+                AGENT_NAME,
+                task["PromptVersion"],
+                model,
+                tc["CandidateRankWithinAgent"],
+                tc["TitleKey"],
+                tc.get("RaciTitle"),
+                tc.get("CandidateConfidence"),
+                tc.get("WhyPlausible"),
+                ts,
+            ])
 
         con.execute("""
             UPDATE my_db.mdr_reconciliation.MdrReconciliationTasks
@@ -750,6 +821,7 @@ def main():
 
     con = connect_motherduck()
     ensure_agent_eval_table(con)
+    ensure_agent_top_candidates_table(con)
 
     if args.batch_collect:
         batch_id = (args.batch_id or "").strip() or (BATCH_ID_FILE.read_text(encoding="utf-8").strip() if BATCH_ID_FILE.exists() else "")

@@ -1,24 +1,19 @@
 #!/usr/bin/env python3
 """
-Judge per riconciliazione MDR: legge le decisioni dei due agenti, emette il giudizio finale
-e scrive in MdrReconciliationAgentDecisions e MdrReconciliationResults.
+Judge per riconciliazione MDR: unico scrittore di MdrReconciliationResults.
+
+Logica:
+- Legge decisioni e top3 da MdrReconciliationAgentDecisions e MdrReconciliationAgentTopCandidates.
+- Legge top50 retrieval dalla view arricchita (MdrToRaciCandidates).
+- CONSENSO (stesso MATCH o entrambi NO_MATCH): risolve deterministicamente, NON chiama Gemini.
+- CONFLITTO (MATCH vs MATCH diverso, o MATCH vs NO_MATCH): chiama Gemini e scrive risultato.
+- Scrive sempre il risultato in MdrReconciliationResults (ResolvedBy='judge_script').
+- Scrive in MdrReconciliationAgentDecisions solo quando Gemini viene chiamato (AgentName='judge_gemini').
 
 Config: config.txt (MOTHERDUCK_*, PROMPT_VERSION, VERTEX_*). Vedi config.example.txt.
 
-Uso in tempo reale (default)
-  Elabora i task ready_for_judge con N worker paralleli (Vertex AI / Gemini).
-  python 3.3_run_judge.py [--prompt-version v1] [--embedding-model ...] [--limit N] [--workers 4] [--output-prompt-version ...] [--model ...]
-
-Uso con Batch Vertex AI (Gemini batch inference, ~50% costo, GCS obbligatorio)
-  Config: VERTEX_BATCH_GCS_BUCKET (e opzionale VERTEX_BATCH_GCS_PREFIX).
-  1) Submit: carica il JSONL su GCS e crea il job di batch (elaborazione asincrona, entro 24h).
-     python 3.3_run_judge.py --batch [--limit N]
-     Job name in .judge_last_batch_id; dettagli in .judge_last_batch_info.json.
-  2) Collect: quando il job è completato, scarica l'output da GCS e scrive in DB.
-     python 3.3_run_judge.py --batch-collect [--batch-id <job_name>] [--output-prompt-version ...]
-     Usa .judge_last_batch_info.json per output_prefix e task_ids (necessario per collect).
-
-Stati JudgeStatus (batch): pending | submitted_{batch_id} | in_batch_{batch_id} | done | error_{batch_id}
+Uso in tempo reale: python 3.3_run_judge.py [--prompt-version v1] [--embedding-model ...] [--limit N] [--workers 4] [--model ...]
+Uso batch (solo task in conflitto): python 3.3_run_judge.py --batch [--limit N] poi --batch-collect
 """
 
 import json
@@ -81,15 +76,26 @@ def _cfg(key: str, default: Optional[str] = None) -> str:
 # --------------------------------------------------
 # Config
 # --------------------------------------------------
-JUDGE_AGENT_NAME = "judge"
 DEFAULT_MODEL = "gemini-2.5-pro"
 
 DB_SCHEMA = "my_db.mdr_reconciliation"
 TASKS_TABLE = f"{DB_SCHEMA}.MdrReconciliationTasks"
 AGENT_DECISIONS_TABLE = f"{DB_SCHEMA}.MdrReconciliationAgentDecisions"
+AGENT_TOP_CANDIDATES_TABLE = f"{DB_SCHEMA}.MdrReconciliationAgentTopCandidates"
 FINAL_RESULTS_TABLE = f"{DB_SCHEMA}.MdrReconciliationResults"
 AGENT_INPUT_VIEW = f"{DB_SCHEMA}.v_MdrReconciliationAgentInput"
+CANDIDATES_TABLE = f"{DB_SCHEMA}.MdrToRaciCandidates"
 MDR_VIEW = "my_db.historical_mdr_normalization.v_MdrPreviousRecords_Normalized_All"
+
+AGENT1_NAME = "gpt5mini"
+AGENT2_NAME = "claude"
+JUDGE_AGENT_NAME_GEMINI = "judge_gemini"
+
+# Resolution modes (consensus = no Gemini; conflict = Gemini used)
+RESOLUTION_CONSENSUS_MATCH = "judge_script_consensus_match"
+RESOLUTION_CONSENSUS_NO_MATCH = "judge_script_consensus_no_match"
+RESOLUTION_LLM_MATCH_MATCH = "judge_llm_match_match_conflict"
+RESOLUTION_LLM_MATCH_NO_MATCH = "judge_llm_match_no_match_conflict"
 
 # Vertex AI / Gemini (google-genai SDK); credentials da config.txt
 _creds_rel = _cfg("VERTEX_CREDENTIALS_PATH")
@@ -126,11 +132,7 @@ def connect_motherduck() -> duckdb.DuckDBPyConnection:
 
 
 # --------------------------------------------------
-# Bootstrap final results table.
-# Chiave (TaskId, PromptVersion, EmbeddingModel): la PromptVersion in output
-# distingue le esecuzioni per test/comparazione; righe con versione diversa non
-# si sovrascrivono. Se la tabella esisteva con PK solo su TaskId, ricrearla:
-#   DROP TABLE my_db.mdr_reconciliation.MdrReconciliationResults;
+# Bootstrap tables
 # --------------------------------------------------
 def ensure_final_results_table(con: duckdb.DuckDBPyConnection) -> None:
     con.execute(f"""
@@ -141,13 +143,44 @@ def ensure_final_results_table(con: duckdb.DuckDBPyConnection) -> None:
       EmbeddingModel       VARCHAR NOT NULL,
       FinalTitleKey        VARCHAR,
       FinalRaciTitle       VARCHAR,
-      FinalDecisionType    VARCHAR NOT NULL,   -- MATCH | NO_MATCH | MANUAL_REVIEW
+      FinalDecisionType    VARCHAR NOT NULL,
       FinalConfidence      DOUBLE,
       ResolutionMode       VARCHAR NOT NULL,
       FinalReason          VARCHAR NOT NULL,
+      ResolvedBy           VARCHAR NOT NULL DEFAULT 'judge_script',
+      JudgeUsedFlag        BOOLEAN NOT NULL DEFAULT FALSE,
+      JudgeModel           VARCHAR,
       CreatedAt            TIMESTAMP NOT NULL,
       UpdatedAt            TIMESTAMP NOT NULL,
       PRIMARY KEY (TaskId, PromptVersion, EmbeddingModel)
+    );
+    """)
+    _add_column_if_missing(con, FINAL_RESULTS_TABLE, "ResolvedBy", "VARCHAR")
+    _add_column_if_missing(con, FINAL_RESULTS_TABLE, "JudgeUsedFlag", "BOOLEAN")
+    _add_column_if_missing(con, FINAL_RESULTS_TABLE, "JudgeModel", "VARCHAR")
+
+
+def _add_column_if_missing(con: duckdb.DuckDBPyConnection, table: str, column: str, col_type: str) -> None:
+    try:
+        con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+    except Exception:
+        pass  # column already exists
+
+
+def ensure_agent_top_candidates_table(con: duckdb.DuckDBPyConnection) -> None:
+    con.execute(f"""
+    CREATE TABLE IF NOT EXISTS {AGENT_TOP_CANDIDATES_TABLE} (
+      TaskId                    VARCHAR NOT NULL,
+      AgentName                 VARCHAR NOT NULL,
+      PromptVersion             VARCHAR NOT NULL,
+      ModelName                 VARCHAR,
+      CandidateRankWithinAgent   INTEGER NOT NULL,
+      TitleKey                  VARCHAR NOT NULL,
+      RaciTitle                 VARCHAR,
+      CandidateConfidence       DOUBLE,
+      WhyPlausible              VARCHAR,
+      CreatedAt                 TIMESTAMP NOT NULL,
+      PRIMARY KEY (TaskId, AgentName, CandidateRankWithinAgent)
     );
     """)
 
@@ -229,31 +262,10 @@ def fetch_candidates_for_task(
     con: duckdb.DuckDBPyConnection,
     document_title: str,
     prompt_version: str,
-    embedding_model: str
+    embedding_model: str,
 ) -> List[Dict[str, Any]]:
-    rows = con.execute(f"""
-        SELECT
-          Rank,
-          Similarity,
-          TitleKey,
-          RaciTitle,
-          EffectiveDescription,
-          DisciplineName,
-          TypeName,
-          CategoryDescription,
-          ChapterName
-        FROM {AGENT_INPUT_VIEW}
-        WHERE Document_title = ?
-          AND PromptVersion = ?
-          AND EmbeddingModel = ?
-        ORDER BY Rank
-    """, [document_title, prompt_version, embedding_model]).fetchall()
-
-    cols = [
-        "Rank", "Similarity", "TitleKey", "RaciTitle", "EffectiveDescription",
-        "DisciplineName", "TypeName", "CategoryDescription", "ChapterName"
-    ]
-    return [dict(zip(cols, r)) for r in rows]
+    """Top50 retrieval candidates (enriched). Delegates to load_retrieval_candidates."""
+    return load_retrieval_candidates(con, document_title, prompt_version, embedding_model, limit=50)
 
 
 def fetch_mdr_context(
@@ -292,7 +304,24 @@ def fetch_mdr_context(
 
 
 def fetch_agent_decisions(con: duckdb.DuckDBPyConnection, task_id: str) -> Dict[str, Dict[str, Any]]:
-    rows = con.execute(f"""
+    """Return both agent decisions keyed by agent name (gpt5mini, claude)."""
+    a1 = load_agent_decision(con, task_id, AGENT1_NAME)
+    a2 = load_agent_decision(con, task_id, AGENT2_NAME)
+    out = {}
+    if a1:
+        out[AGENT1_NAME] = a1
+    if a2:
+        out[AGENT2_NAME] = a2
+    return out
+
+
+def load_agent_decision(
+    con: duckdb.DuckDBPyConnection,
+    task_id: str,
+    agent_name: str,
+) -> Optional[Dict[str, Any]]:
+    """Load one agent decision from MdrReconciliationAgentDecisions. Returns None if missing."""
+    row = con.execute(f"""
         SELECT
           AgentName,
           AgentModel,
@@ -302,22 +331,163 @@ def fetch_agent_decisions(con: duckdb.DuckDBPyConnection, task_id: str) -> Dict[
           Confidence,
           ReasoningSummary
         FROM {AGENT_DECISIONS_TABLE}
-        WHERE TaskId = ?
-          AND AgentName IN ('gpt5mini', 'claude')
-    """, [task_id]).fetchall()
+        WHERE TaskId = ? AND AgentName = ?
+    """, [task_id, agent_name]).fetchone()
+    if not row:
+        return None
+    return {
+        "AgentName": row[0],
+        "AgentModel": row[1],
+        "SelectedTitleKey": row[2],
+        "SelectedRaciTitle": row[3],
+        "DecisionType": row[4],
+        "Confidence": float(row[5]) if row[5] is not None else None,
+        "ReasoningSummary": row[6],
+    }
 
-    out = {}
-    for r in rows:
-        out[r[0]] = {
-            "AgentName": r[0],
-            "AgentModel": r[1],
-            "SelectedTitleKey": r[2],
-            "SelectedRaciTitle": r[3],
-            "DecisionType": r[4],
-            "Confidence": float(r[5]) if r[5] is not None else None,
-            "ReasoningSummary": r[6],
+
+def load_agent_top_candidates(
+    con: duckdb.DuckDBPyConnection,
+    task_id: str,
+    agent_name: str,
+) -> List[Dict[str, Any]]:
+    """Load top 3 candidates for one agent from MdrReconciliationAgentTopCandidates. Returns [] if missing."""
+    try:
+        rows = con.execute(f"""
+            SELECT
+              TaskId,
+              AgentName,
+              PromptVersion,
+              ModelName,
+              CandidateRankWithinAgent,
+              TitleKey,
+              RaciTitle,
+              CandidateConfidence,
+              WhyPlausible,
+              CreatedAt
+            FROM {AGENT_TOP_CANDIDATES_TABLE}
+            WHERE TaskId = ? AND AgentName = ?
+            ORDER BY CandidateRankWithinAgent
+            LIMIT 3
+        """, [task_id, agent_name]).fetchall()
+    except Exception:
+        return []
+    cols = [
+        "TaskId", "AgentName", "PromptVersion", "ModelName",
+        "CandidateRankWithinAgent", "TitleKey", "RaciTitle",
+        "CandidateConfidence", "WhyPlausible", "CreatedAt"
+    ]
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def load_retrieval_candidates(
+    con: duckdb.DuckDBPyConnection,
+    document_title: str,
+    prompt_version: str,
+    embedding_model: str,
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
+    """Load top50 retrieval candidates (enriched) from view. Same as fetch_candidates_for_task with limit."""
+    rows = con.execute(f"""
+        SELECT
+          Rank,
+          Similarity,
+          TitleKey,
+          RaciTitle,
+          EffectiveDescription,
+          DisciplineName,
+          TypeName,
+          CategoryDescription,
+          ChapterName
+        FROM {AGENT_INPUT_VIEW}
+        WHERE Document_title = ?
+          AND PromptVersion = ?
+          AND EmbeddingModel = ?
+        ORDER BY Rank
+        LIMIT ?
+    """, [document_title, prompt_version, embedding_model, limit]).fetchall()
+    cols = [
+        "Rank", "Similarity", "TitleKey", "RaciTitle", "EffectiveDescription",
+        "DisciplineName", "TypeName", "CategoryDescription", "ChapterName"
+    ]
+    return [dict(zip(cols, r)) for r in rows]
+
+
+# --------------------------------------------------
+# Resolution case classification and consensus
+# --------------------------------------------------
+CASE_CONSENSUS_MATCH = "consensus_match"
+CASE_CONSENSUS_NO_MATCH = "consensus_no_match"
+CASE_MATCH_MATCH_CONFLICT = "match_match_conflict"
+CASE_MATCH_NO_MATCH_CONFLICT = "match_no_match_conflict"
+CASE_MISSING_DATA = "missing_data"
+
+
+def classify_resolution_case(
+    agent1: Optional[Dict[str, Any]],
+    agent2: Optional[Dict[str, Any]],
+) -> str:
+    """
+    Classify task into one of four resolution cases or missing_data.
+    Returns: consensus_match | consensus_no_match | match_match_conflict | match_no_match_conflict | missing_data
+    """
+    if not agent1 or not agent2:
+        return CASE_MISSING_DATA
+    dt1 = (agent1.get("DecisionType") or "").strip().upper()
+    dt2 = (agent2.get("DecisionType") or "").strip().upper()
+    if dt1 not in ("MATCH", "NO_MATCH") or dt2 not in ("MATCH", "NO_MATCH"):
+        return CASE_MISSING_DATA
+    if dt1 == "NO_MATCH" and dt2 == "NO_MATCH":
+        return CASE_CONSENSUS_NO_MATCH
+    if dt1 == "MATCH" and dt2 == "MATCH":
+        key1 = norm(agent1.get("SelectedTitleKey"))
+        key2 = norm(agent2.get("SelectedTitleKey"))
+        if key1 and key2 and key1 == key2:
+            return CASE_CONSENSUS_MATCH
+        return CASE_MATCH_MATCH_CONFLICT
+    return CASE_MATCH_NO_MATCH_CONFLICT
+
+
+def resolve_consensus_case(
+    case: str,
+    agent1: Dict[str, Any],
+    agent2: Dict[str, Any],
+    task: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Build result dict for consensus (no Gemini). Used by write_final_result.
+    case must be CASE_CONSENSUS_MATCH or CASE_CONSENSUS_NO_MATCH.
+    """
+    if case == CASE_CONSENSUS_NO_MATCH:
+        return {
+            "FinalDecisionType": "NO_MATCH",
+            "FinalTitleKey": None,
+            "FinalRaciTitle": None,
+            "FinalConfidence": 0.0,
+            "FinalReason": "Both agents agreed: no credible match.",
+            "ResolutionMode": RESOLUTION_CONSENSUS_NO_MATCH,
+            "ResolvedBy": "judge_script",
+            "JudgeUsedFlag": False,
+            "JudgeModel": None,
         }
-    return out
+    if case == CASE_CONSENSUS_MATCH:
+        key = norm(agent1.get("SelectedTitleKey"))
+        title = norm(agent1.get("SelectedRaciTitle") or agent2.get("SelectedRaciTitle"))
+        c1 = agent1.get("Confidence")
+        c2 = agent2.get("Confidence")
+        conf = (float(c1) + float(c2)) / 2.0 if c1 is not None and c2 is not None else 0.9
+        return {
+            "FinalDecisionType": "MATCH",
+            "FinalTitleKey": key,
+            "FinalRaciTitle": title or "",
+            "FinalConfidence": conf,
+            "FinalReason": "Both agents agreed on the same match.",
+            "ResolutionMode": RESOLUTION_CONSENSUS_MATCH,
+            "ResolvedBy": "judge_script",
+            "JudgeUsedFlag": False,
+            "JudgeModel": None,
+        }
+    raise ValueError(f"resolve_consensus_case called with case={case}")
 
 
 # --------------------------------------------------
@@ -346,8 +516,8 @@ RESPONSE_SCHEMA = {
         "resolution_mode": {
             "type": "string",
             "enum": [
-                "agent_consensus",
-                "judge_override",
+                "match_match_conflict_resolved",
+                "match_no_match_conflict_resolved",
                 "no_credible_candidate",
                 "ambiguous_candidates"
             ]
@@ -364,72 +534,27 @@ RESPONSE_SCHEMA = {
 }
 
 SYSTEM_PROMPT = """
-You are the final judge for EPC document title reconciliation.
+You are the final conflict resolver for EPC document title reconciliation. You are only invoked when the two agents (GPT and Claude) disagree.
 
-You will receive:
-- one historical MDR title with normalized metadata
-- 50 candidate RACI documents
-- the decisions of two independent agents
+Disagreement cases:
+- match_match_conflict: both agents chose MATCH but selected different candidates (X vs Y).
+- match_no_match_conflict: one agent chose MATCH, the other NO_MATCH.
 
-Your task:
-Determine the final reconciliation outcome.
+Your task: resolve the conflict and decide the final outcome. You do not re-evaluate from scratch; you use the agents' decisions and their top-3 candidates as the primary focus, and the full top-50 list only to verify whether a better candidate was missed.
 
 Allowed outcomes:
-- MATCH
-- NO_MATCH
-- MANUAL_REVIEW
-
-Definitions:
-
-MATCH
-Select MATCH only if one candidate is clearly the best semantic match.
-
-NO_MATCH
-Choose NO_MATCH when none of the candidates is sufficiently credible.
-
-MANUAL_REVIEW
-Use MANUAL_REVIEW only when genuine ambiguity exists between plausible candidates or when a plausible candidate cannot be confidently confirmed or rejected.
-
-Core principles:
-- Similarity scores are retrieval hints, not proof of equivalence.
-- Prefer semantic equivalence over lexical overlap.
-- Metadata compatibility is important supporting evidence.
-- Strong metadata incompatibility is negative evidence.
-- Do not overuse MANUAL_REVIEW.
-
-Use agent decisions as evidence, not authority.
-
-Decision logic:
-
-1. If both agents selected the same candidate and the candidate is semantically consistent → MATCH is strongly supported.
-
-2. If agents selected different candidates:
-   - Choose MATCH only if one candidate is clearly superior.
-
-3. If neither agent found a credible candidate and the candidates appear weak → choose NO_MATCH.
-
-4. Choose MANUAL_REVIEW only when:
-   - two or more candidates appear genuinely plausible, or
-   - a candidate appears plausible but evidence is insufficient to safely accept or reject it.
-
-Output JSON only with:
-- decision_type
-- selected_titlekey
-- selected_raci_title
-- confidence
-- resolution_mode
-- reasoning_summary
-
-Decision logic:
-- If both agents selected the same candidate and the candidate is semantically consistent, MATCH is strongly supported.
-- If agents disagree, choose MATCH only if one candidate is clearly better supported.
-- Choose NO_MATCH when the best available candidate is still weak, generic, metadata-incompatible, or not clearly equivalent.
-- Choose MANUAL_REVIEW only when there is real ambiguity between plausible candidates or a plausible-but-inconclusive candidate that warrants human review.
+- MATCH: one candidate is clearly the best; choose only from the provided top-50.
+- NO_MATCH: no candidate is sufficiently credible.
+- MANUAL_REVIEW: genuine ambiguity between plausible candidates or insufficient evidence to safely accept or reject.
 
 Rules:
-- confidence must be between 0 and 1
-- selected_titlekey and selected_raci_title must be null for NO_MATCH and MANUAL_REVIEW
-- reasoning_summary maximum 100 words
+- Primary focus: the two agents' top-3 candidate lists. Full top-50 is the complete verification context.
+- You may select only from the provided top-50 candidates. Similarity scores are retrieval evidence only; metadata and semantics matter more than lexical overlap.
+- selected_titlekey and selected_raci_title must be null when decision_type is NO_MATCH or MANUAL_REVIEW.
+- confidence between 0 and 1. reasoning_summary brief and factual (max 100 words).
+- resolution_mode must reflect how you resolved the conflict: match_match_conflict_resolved, match_no_match_conflict_resolved, no_credible_candidate, or ambiguous_candidates.
+
+Output JSON only with: decision_type, selected_titlekey, selected_raci_title, confidence, resolution_mode, reasoning_summary.
 """
 
 
@@ -437,9 +562,11 @@ def build_user_prompt(
     mdr_ctx: Dict[str, Any],
     candidates: List[Dict[str, Any]],
     agent1: Dict[str, Any],
-    agent2: Dict[str, Any]
+    agent2: Dict[str, Any],
+    top3_agent1: Optional[List[Dict[str, Any]]] = None,
+    top3_agent2: Optional[List[Dict[str, Any]]] = None,
+    disagreement_type: Optional[str] = None,
 ) -> str:
-
     blocks = []
 
     blocks.append("HISTORICAL MDR RECORD")
@@ -450,19 +577,12 @@ def build_user_prompt(
     blocks.append(f"Type_L1_Status: {norm(mdr_ctx.get('Type_L1_Status'))}")
     blocks.append("")
 
-    blocks.append("EVALUATION GUIDANCE")
-    blocks.append("- SimilarityScore is a retrieval hint only, not proof of equivalence")
-    blocks.append("- Prefer semantic equivalence between MDR title and candidate meaning")
-    blocks.append("- Use discipline, type, category, and chapter as supporting evidence")
-    blocks.append("- Strong metadata incompatibility is a negative signal")
-    blocks.append("- Choose MATCH only if one candidate is clearly the best")
-    blocks.append("- Choose NO_MATCH if the best candidate is still weak, generic, metadata-incompatible, or not clearly equivalent")
-    blocks.append("- Do not use MANUAL_REVIEW as a default fallback")
-    blocks.append("- Choose MANUAL_REVIEW only when there is genuine ambiguity between plausible candidates or a plausible-but-inconclusive candidate worth human review")
-    blocks.append("")
+    if disagreement_type:
+        blocks.append("DISAGREEMENT TYPE")
+        blocks.append(disagreement_type)
+        blocks.append("")
 
     blocks.append("AGENT DECISIONS")
-
     blocks.append("Agent 1 (gpt5mini)")
     blocks.append(f"DecisionType: {norm(agent1.get('DecisionType'))}")
     blocks.append(f"SelectedTitleKey: {norm(agent1.get('SelectedTitleKey'))}")
@@ -470,7 +590,6 @@ def build_user_prompt(
     blocks.append(f"Confidence: {agent1.get('Confidence')}")
     blocks.append(f"ReasoningSummary: {norm(agent1.get('ReasoningSummary'))}")
     blocks.append("")
-
     blocks.append("Agent 2 (claude)")
     blocks.append(f"DecisionType: {norm(agent2.get('DecisionType'))}")
     blocks.append(f"SelectedTitleKey: {norm(agent2.get('SelectedTitleKey'))}")
@@ -479,18 +598,26 @@ def build_user_prompt(
     blocks.append(f"ReasoningSummary: {norm(agent2.get('ReasoningSummary'))}")
     blocks.append("")
 
-    blocks.append("CANDIDATES")
+    blocks.append("AGENT TOP CANDIDATES")
+    if top3_agent1:
+        blocks.append("Top 3 GPT (gpt5mini):")
+        for i, tc in enumerate(top3_agent1[:3], 1):
+            blocks.append(f"  {i}. TitleKey={norm(tc.get('TitleKey'))} RaciTitle={norm(tc.get('RaciTitle'))} Confidence={tc.get('CandidateConfidence')} WhyPlausible={norm(tc.get('WhyPlausible'))}")
+        blocks.append("")
+    if top3_agent2:
+        blocks.append("Top 3 Claude:")
+        for i, tc in enumerate(top3_agent2[:3], 1):
+            blocks.append(f"  {i}. TitleKey={norm(tc.get('TitleKey'))} RaciTitle={norm(tc.get('RaciTitle'))} Confidence={tc.get('CandidateConfidence')} WhyPlausible={norm(tc.get('WhyPlausible'))}")
+        blocks.append("")
 
+    blocks.append("FULL TOP50 CANDIDATES")
+    blocks.append("(Use for verification only; primary focus is the agents' top-3 lists above.)")
     for c in candidates:
-
         selected_by = []
-
         if str(c["TitleKey"]) == str(agent1.get("SelectedTitleKey")):
             selected_by.append("Agent1")
-
         if str(c["TitleKey"]) == str(agent2.get("SelectedTitleKey")):
             selected_by.append("Agent2")
-
         blocks.append("----")
         blocks.append(f"Rank: {c['Rank']}")
         blocks.append(f"SimilarityScore: {float(c['Similarity']):.4f}")
@@ -576,6 +703,13 @@ def validate_judge_output(result: Dict[str, Any], candidates: List[Dict[str, Any
     if confidence > 1:
         confidence = 1.0
 
+    valid_resolution_modes = (
+        "match_match_conflict_resolved", "match_no_match_conflict_resolved",
+        "no_credible_candidate", "ambiguous_candidates"
+    )
+    if resolution_mode not in valid_resolution_modes:
+        resolution_mode = "no_credible_candidate" if decision_type == "NO_MATCH" else "ambiguous_candidates"
+
     if decision_type in ("NO_MATCH", "MANUAL_REVIEW"):
         return {
             "FinalDecisionType": decision_type,
@@ -583,7 +717,7 @@ def validate_judge_output(result: Dict[str, Any], candidates: List[Dict[str, Any
             "FinalRaciTitle": None,
             "FinalConfidence": confidence,
             "FinalReason": reasoning_summary or "No final candidate selected.",
-            "ResolutionMode": resolution_mode or ("no_credible_candidate" if decision_type == "NO_MATCH" else "ambiguous_candidates")
+            "ResolutionMode": resolution_mode,
         }
 
     if decision_type != "MATCH":
@@ -607,64 +741,123 @@ def validate_judge_output(result: Dict[str, Any], candidates: List[Dict[str, Any
         "FinalRaciTitle": norm(selected_raci_title),
         "FinalConfidence": confidence,
         "FinalReason": reasoning_summary or "Judge selected the best supported candidate.",
-        "ResolutionMode": resolution_mode or "judge_override"
+        "ResolutionMode": resolution_mode if resolution_mode in (
+            "match_match_conflict_resolved", "match_no_match_conflict_resolved",
+            "no_credible_candidate", "ambiguous_candidates"
+        ) else "match_match_conflict_resolved",
     }
 
 
+def resolve_conflict_with_gemini(
+    con: duckdb.DuckDBPyConnection,
+    model: str,
+    mdr_ctx: Dict[str, Any],
+    candidates: List[Dict[str, Any]],
+    agent1: Dict[str, Any],
+    agent2: Dict[str, Any],
+    top3_agent1: List[Dict[str, Any]],
+    top3_agent2: List[Dict[str, Any]],
+    task: Dict[str, Any],
+    resolution_mode: str,
+) -> Dict[str, Any]:
+    """
+    Call Gemini for conflict resolution; return result dict for write_final_result.
+    resolution_mode must be RESOLUTION_LLM_MATCH_MATCH or RESOLUTION_LLM_MATCH_NO_MATCH.
+    """
+    disagreement_type = "match_match_conflict" if resolution_mode == RESOLUTION_LLM_MATCH_MATCH else "match_no_match_conflict"
+    user_prompt = build_user_prompt(
+        mdr_ctx, candidates, agent1, agent2,
+        top3_agent1=top3_agent1 or None,
+        top3_agent2=top3_agent2 or None,
+        disagreement_type=disagreement_type,
+    )
+    full_prompt = f"{SYSTEM_PROMPT.strip()}\n\nUSER INPUT:\n{user_prompt}"
+    response = _genai_client.models.generate_content(model=model, contents=full_prompt)
+    raw_text = getattr(response, "text", None) or ""
+    cleaned = _extract_json_payload(raw_text)
+    raw_result = json.loads(cleaned)
+    validated = validate_judge_output(raw_result, candidates)
+    validated["ResolvedBy"] = "judge_script"
+    validated["JudgeUsedFlag"] = True
+    validated["JudgeModel"] = "gemini"
+    if validated.get("ResolutionMode") not in (
+        "match_match_conflict_resolved", "match_no_match_conflict_resolved",
+        "no_credible_candidate", "ambiguous_candidates"
+    ):
+        validated["ResolutionMode"] = resolution_mode
+    return validated
+
+
 # --------------------------------------------------
-# Save outputs
+# Save outputs: judge_gemini row (only when Gemini used) + final result
 # --------------------------------------------------
-def save_judge_result(
+def save_judge_agent_decision(
     con: duckdb.DuckDBPyConnection,
     task: Dict[str, Any],
     model: str,
     judge_result: Dict[str, Any],
     output_prompt_version: Optional[str] = None,
 ) -> None:
+    """Insert judge_gemini row into MdrReconciliationAgentDecisions (only when Gemini was called)."""
     ts = now_ts_naive_utc()
-    prompt_version_for_save = (output_prompt_version and output_prompt_version.strip()) or task["PromptVersion"]
+    pv = (output_prompt_version and output_prompt_version.strip()) or task["PromptVersion"]
+    con.execute(f"""
+        INSERT INTO {AGENT_DECISIONS_TABLE}
+          (TaskId, AgentName, AgentModel, Document_title, PromptVersion, EmbeddingModel,
+           SelectedTitleKey, SelectedRaciTitle, DecisionType, Confidence, ReasoningSummary, CreatedAt)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (TaskId, AgentName) DO UPDATE SET
+          AgentModel = excluded.AgentModel,
+          Document_title = excluded.Document_title,
+          PromptVersion = excluded.PromptVersion,
+          EmbeddingModel = excluded.EmbeddingModel,
+          SelectedTitleKey = excluded.SelectedTitleKey,
+          SelectedRaciTitle = excluded.SelectedRaciTitle,
+          DecisionType = excluded.DecisionType,
+          Confidence = excluded.Confidence,
+          ReasoningSummary = excluded.ReasoningSummary,
+          CreatedAt = excluded.CreatedAt
+    """, [
+        task["TaskId"],
+        JUDGE_AGENT_NAME_GEMINI,
+        model,
+        task["Document_title"],
+        pv,
+        task["EmbeddingModel"],
+        judge_result["FinalTitleKey"],
+        judge_result["FinalRaciTitle"],
+        judge_result["FinalDecisionType"],
+        judge_result["FinalConfidence"],
+        judge_result["FinalReason"],
+        ts,
+    ])
+
+
+def write_final_result(
+    con: duckdb.DuckDBPyConnection,
+    task: Dict[str, Any],
+    result_dict: Dict[str, Any],
+    output_prompt_version: Optional[str] = None,
+) -> None:
+    """
+    Write final result to MdrReconciliationResults (only writer). Update task status.
+    result_dict must contain: FinalDecisionType, FinalTitleKey, FinalRaciTitle, FinalConfidence,
+    FinalReason, ResolutionMode, ResolvedBy, JudgeUsedFlag, JudgeModel.
+    """
+    ts = now_ts_naive_utc()
+    pv = (output_prompt_version and output_prompt_version.strip()) or task["PromptVersion"]
+    next_final_status = "completed"
+    if result_dict.get("FinalDecisionType") == "MANUAL_REVIEW":
+        next_final_status = "manual_review"
 
     con.execute("BEGIN;")
     try:
-        # Save judge decision in agent decisions table
-        con.execute(f"""
-            INSERT INTO {AGENT_DECISIONS_TABLE}
-              (TaskId, AgentName, AgentModel, Document_title, PromptVersion, EmbeddingModel,
-               SelectedTitleKey, SelectedRaciTitle, DecisionType, Confidence, ReasoningSummary, CreatedAt)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (TaskId, AgentName) DO UPDATE SET
-              AgentModel = excluded.AgentModel,
-              Document_title = excluded.Document_title,
-              PromptVersion = excluded.PromptVersion,
-              EmbeddingModel = excluded.EmbeddingModel,
-              SelectedTitleKey = excluded.SelectedTitleKey,
-              SelectedRaciTitle = excluded.SelectedRaciTitle,
-              DecisionType = excluded.DecisionType,
-              Confidence = excluded.Confidence,
-              ReasoningSummary = excluded.ReasoningSummary,
-              CreatedAt = excluded.CreatedAt
-        """, [
-            task["TaskId"],
-            JUDGE_AGENT_NAME,
-            model,
-            task["Document_title"],
-            prompt_version_for_save,
-            task["EmbeddingModel"],
-            judge_result["FinalTitleKey"],
-            judge_result["FinalRaciTitle"],
-            judge_result["FinalDecisionType"],
-            judge_result["FinalConfidence"],
-            judge_result["FinalReason"],
-            ts
-        ])
-
-        # Save final result (PromptVersion in output = versione usata per distinguere i test; non si sovrascrivono righe con versione diversa)
         con.execute(f"""
             INSERT INTO {FINAL_RESULTS_TABLE}
               (TaskId, Document_title, PromptVersion, EmbeddingModel,
                FinalTitleKey, FinalRaciTitle, FinalDecisionType, FinalConfidence,
-               ResolutionMode, FinalReason, CreatedAt, UpdatedAt)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ResolutionMode, FinalReason, ResolvedBy, JudgeUsedFlag, JudgeModel, CreatedAt, UpdatedAt)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (TaskId, PromptVersion, EmbeddingModel) DO UPDATE SET
               Document_title = excluded.Document_title,
               FinalTitleKey = excluded.FinalTitleKey,
@@ -673,38 +866,32 @@ def save_judge_result(
               FinalConfidence = excluded.FinalConfidence,
               ResolutionMode = excluded.ResolutionMode,
               FinalReason = excluded.FinalReason,
+              ResolvedBy = excluded.ResolvedBy,
+              JudgeUsedFlag = excluded.JudgeUsedFlag,
+              JudgeModel = excluded.JudgeModel,
               UpdatedAt = excluded.UpdatedAt
         """, [
             task["TaskId"],
             task["Document_title"],
-            prompt_version_for_save,
+            pv,
             task["EmbeddingModel"],
-            judge_result["FinalTitleKey"],
-            judge_result["FinalRaciTitle"],
-            judge_result["FinalDecisionType"],
-            judge_result["FinalConfidence"],
-            judge_result["ResolutionMode"],
-            judge_result["FinalReason"],
+            result_dict["FinalTitleKey"],
+            result_dict["FinalRaciTitle"],
+            result_dict["FinalDecisionType"],
+            result_dict["FinalConfidence"],
+            result_dict["ResolutionMode"],
+            result_dict["FinalReason"],
+            result_dict.get("ResolvedBy", "judge_script"),
+            result_dict.get("JudgeUsedFlag", False),
+            result_dict.get("JudgeModel"),
             ts,
-            ts
+            ts,
         ])
-
-        # Update task workflow
-        next_final_status = "completed"
-        if judge_result["FinalDecisionType"] == "MANUAL_REVIEW":
-            next_final_status = "manual_review"
-        elif judge_result["FinalDecisionType"] == "NO_MATCH":
-            next_final_status = "completed"
-
         con.execute(f"""
             UPDATE {TASKS_TABLE}
-            SET
-              JudgeStatus = 'done',
-              FinalStatus = ?,
-              UpdatedAt = ?
+            SET JudgeStatus = 'done', FinalStatus = ?, UpdatedAt = ?
             WHERE TaskId = ?
         """, [next_final_status, ts, task["TaskId"]])
-
         con.execute("COMMIT;")
     except Exception:
         con.execute("ROLLBACK;")
@@ -819,8 +1006,12 @@ def run_batch_submit(
     con: duckdb.DuckDBPyConnection,
     tasks: List[Dict[str, Any]],
     model: str,
+    output_prompt_version: Optional[str] = None,
 ) -> str:
-    """Build Vertex-format JSONL, upload to GCS, create Vertex batch job, mark tasks submitted_{batch_id}. Returns job name."""
+    """
+    Classify each task: consensus -> write_final_result immediately; conflict -> add to batch.
+    Returns job name if batch was created; empty string if all consensus (no batch).
+    """
     bucket = _cfg("VERTEX_BATCH_GCS_BUCKET")
     if not bucket:
         raise RuntimeError("Per il batch Vertex serve VERTEX_BATCH_GCS_BUCKET in config.txt")
@@ -830,30 +1021,56 @@ def run_batch_submit(
     project_id = _cfg("VERTEX_PROJECT_ID")
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
+    consensus_count = 0
     lines: List[str] = []
-    submitted_task_ids: List[str] = []
+    conflict_tasks: List[Dict[str, str]] = []  # [{"task_id": ..., "resolution_mode": ...}, ...]
+
     for task in tasks:
-        candidates = fetch_candidates_for_task(
-            con=con,
-            document_title=task["Document_title"],
-            prompt_version=task["PromptVersion"],
-            embedding_model=task["EmbeddingModel"],
+        agent1 = load_agent_decision(con, task["TaskId"], AGENT1_NAME)
+        agent2 = load_agent_decision(con, task["TaskId"], AGENT2_NAME)
+        if not agent1 or not agent2:
+            continue
+        case = classify_resolution_case(agent1, agent2)
+        if case == CASE_MISSING_DATA:
+            continue
+        if case == CASE_CONSENSUS_MATCH or case == CASE_CONSENSUS_NO_MATCH:
+            result_dict = resolve_consensus_case(case, agent1, agent2, task)
+            write_final_result(con, task, result_dict, output_prompt_version)
+            consensus_count += 1
+            continue
+        if case == CASE_MATCH_MATCH_CONFLICT:
+            resolution_mode = RESOLUTION_LLM_MATCH_MATCH
+        else:
+            resolution_mode = RESOLUTION_LLM_MATCH_NO_MATCH
+
+        candidates = load_retrieval_candidates(
+            con, task["Document_title"], task["PromptVersion"], task["EmbeddingModel"], limit=50
         )
         if not candidates:
             continue
-        decisions = fetch_agent_decisions(con, task["TaskId"])
-        agent1 = decisions.get("gpt5mini")
-        agent2 = decisions.get("claude")
-        if not agent1 or not agent2:
-            continue
+        top3_a1 = load_agent_top_candidates(con, task["TaskId"], AGENT1_NAME)
+        top3_a2 = load_agent_top_candidates(con, task["TaskId"], AGENT2_NAME)
         mdr_ctx = fetch_mdr_context(con, task["Document_title"])
-        user_prompt = build_user_prompt(mdr_ctx, candidates, agent1, agent2)
+        disagreement_type = "match_match_conflict" if resolution_mode == RESOLUTION_LLM_MATCH_MATCH else "match_no_match_conflict"
+        user_prompt = build_user_prompt(
+            mdr_ctx, candidates, agent1, agent2,
+            top3_agent1=top3_a1 or None,
+            top3_agent2=top3_a2 or None,
+            disagreement_type=disagreement_type,
+        )
         full_prompt = f"{SYSTEM_PROMPT.strip()}\n\nUSER INPUT:\n{user_prompt}"
         line_obj = _vertex_batch_request_line(full_prompt)
         lines.append(json.dumps(line_obj))
-        submitted_task_ids.append(task["TaskId"])
+        conflict_tasks.append({"task_id": task["TaskId"], "resolution_mode": resolution_mode})
+
+    if consensus_count:
+        print(f"Resolved by consensus (no Gemini): {consensus_count} task(s).")
     if not lines:
-        raise RuntimeError("No valid tasks to submit (missing candidates or agent decisions?).")
+        if consensus_count == len(tasks):
+            print("All tasks resolved by consensus; no batch created.")
+        else:
+            print("No conflict tasks to submit (or missing data).")
+        return ""
 
     input_blob = f"{prefix}in/judge_{run_id}.jsonl"
     gcs_input_uri = f"gs://{bucket}/{input_blob}"
@@ -870,6 +1087,7 @@ def run_batch_submit(
     job_name = getattr(job, "name", None) or (job.get("name") if isinstance(job, dict) else "")
     batch_id_short = job_name.split("/")[-1] if job_name and "/" in job_name else (job_name or run_id)
 
+    submitted_task_ids = [ct["task_id"] for ct in conflict_tasks]
     ts = now_ts_naive_utc()
     status_submitted = f"submitted_{batch_id_short}"
     for task_id in submitted_task_ids:
@@ -888,6 +1106,7 @@ def run_batch_submit(
             "output_prefix": gcs_output_uri,
             "input_blob": input_blob,
             "task_ids": submitted_task_ids,
+            "conflict_tasks": conflict_tasks,
         }, indent=2),
         encoding="utf-8",
     )
@@ -921,6 +1140,8 @@ def run_batch_collect(
     output_prefix_uri = info.get("output_prefix") or ""
     input_blob = info.get("input_blob")  # optional, for cleanup (older runs may not have it)
     task_ids = info.get("task_ids") or []
+    conflict_tasks = info.get("conflict_tasks") or []
+    resolution_mode_by_task = {ct["task_id"]: ct["resolution_mode"] for ct in conflict_tasks if isinstance(ct, dict) and ct.get("task_id")}
     if not job_name:
         print("Error: job_name non disponibile (--batch-id o .judge_last_batch_info.json).")
         return
@@ -1005,13 +1226,16 @@ def run_batch_collect(
             continue
         try:
             validated = validate_judge_output(raw_result, candidates)
-            save_judge_result(
-                con=con,
-                task=task,
-                model=model,
-                judge_result=validated,
-                output_prompt_version=output_prompt_version,
-            )
+            if validated.get("ResolutionMode") not in (
+                "match_match_conflict_resolved", "match_no_match_conflict_resolved",
+                "no_credible_candidate", "ambiguous_candidates"
+            ):
+                validated["ResolutionMode"] = resolution_mode_by_task.get(task_id, RESOLUTION_LLM_MATCH_NO_MATCH)
+            validated["ResolvedBy"] = "judge_script"
+            validated["JudgeUsedFlag"] = True
+            validated["JudgeModel"] = "gemini"
+            save_judge_agent_decision(con, task, model, validated, output_prompt_version)
+            write_final_result(con, task, validated, output_prompt_version)
             saved += 1
             print(f"  {task_id} -> {validated['FinalDecisionType']} (saved)")
         except Exception as e:
@@ -1034,35 +1258,49 @@ def process_one_judge_task(
     model: str,
     output_prompt_version: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Run judge pipeline for one task (caller must have claimed it). Returns validated_result on success, None on skip/error."""
-    candidates = fetch_candidates_for_task(
-        con=con,
-        document_title=task["Document_title"],
-        prompt_version=task["PromptVersion"],
-        embedding_model=task["EmbeddingModel"]
+    """
+    Run judge pipeline for one task (caller must have claimed it).
+    Load data -> classify -> consensus: write_final_result; conflict: Gemini -> save_judge_agent_decision -> write_final_result.
+    Returns result dict on success, None on skip/error.
+    """
+    agent1 = load_agent_decision(con, task["TaskId"], AGENT1_NAME)
+    agent2 = load_agent_decision(con, task["TaskId"], AGENT2_NAME)
+    if not agent1 or not agent2:
+        mark_judge_error(con, task["TaskId"])
+        return None
+
+    top3_a1 = load_agent_top_candidates(con, task["TaskId"], AGENT1_NAME)
+    top3_a2 = load_agent_top_candidates(con, task["TaskId"], AGENT2_NAME)
+    candidates = load_retrieval_candidates(
+        con, task["Document_title"], task["PromptVersion"], task["EmbeddingModel"], limit=50
     )
     if not candidates:
         mark_judge_error(con, task["TaskId"])
         return None
 
-    decisions = fetch_agent_decisions(con, task["TaskId"])
-    agent1 = decisions.get("gpt5mini")
-    agent2 = decisions.get("claude")
-    if not agent1 or not agent2:
+    case = classify_resolution_case(agent1, agent2)
+    if case == CASE_MISSING_DATA:
         mark_judge_error(con, task["TaskId"])
         return None
 
+    if case == CASE_CONSENSUS_MATCH or case == CASE_CONSENSUS_NO_MATCH:
+        result_dict = resolve_consensus_case(case, agent1, agent2, task)
+        write_final_result(con, task, result_dict, output_prompt_version)
+        return result_dict
+
+    if case == CASE_MATCH_MATCH_CONFLICT:
+        resolution_mode = RESOLUTION_LLM_MATCH_MATCH
+    else:
+        resolution_mode = RESOLUTION_LLM_MATCH_NO_MATCH
+
     mdr_ctx = fetch_mdr_context(con, task["Document_title"])
-    raw_result = call_judge(
-        model=model,
-        mdr_ctx=mdr_ctx,
-        candidates=candidates,
-        agent1=agent1,
-        agent2=agent2
+    result_dict = resolve_conflict_with_gemini(
+        con, model, mdr_ctx, candidates, agent1, agent2,
+        top3_a1, top3_a2, task, resolution_mode,
     )
-    validated_result = validate_judge_output(raw_result, candidates)
-    save_judge_result(con=con, task=task, model=model, judge_result=validated_result, output_prompt_version=output_prompt_version)
-    return validated_result
+    save_judge_agent_decision(con, task, model, result_dict, output_prompt_version)
+    write_final_result(con, task, result_dict, output_prompt_version)
+    return result_dict
 
 
 def _worker(
@@ -1134,6 +1372,7 @@ def main():
 
     con = connect_motherduck()
     ensure_final_results_table(con)
+    ensure_agent_top_candidates_table(con)
 
     if args.batch_collect:
         job_name = (args.batch_id or "").strip() or (BATCH_ID_FILE.read_text(encoding="utf-8").strip() if BATCH_ID_FILE.exists() else "")
@@ -1162,10 +1401,13 @@ def main():
             print("No ready tasks for batch.")
             con.close()
             return
-        job_name = run_batch_submit(con=con, tasks=tasks, model=args.model)
+        job_name = run_batch_submit(
+            con=con, tasks=tasks, model=args.model, output_prompt_version=args.output_prompt_version
+        )
         con.close()
-        print(f"Batch submitted: {job_name}")
-        print("Run with --batch-collect later to write results to DB (usa .judge_last_batch_info.json).")
+        if job_name:
+            print(f"Batch submitted: {job_name}")
+            print("Run with --batch-collect later to write results to DB (usa .judge_last_batch_info.json).")
         return
 
     tasks = fetch_ready_tasks(
@@ -1213,6 +1455,18 @@ def main():
     except KeyboardInterrupt:
         print("\nInterrupted (Ctrl+C). Exiting...")
 
+
+# --------------------------------------------------
+# Proposed test cases (no test file exists yet)
+# --------------------------------------------------
+# 1. consensus_match: agent1=MATCH(X), agent2=MATCH(X) -> no Gemini, write_final_result with
+#    ResolutionMode=judge_script_consensus_match, JudgeUsedFlag=false, no row in AgentDecisions for judge_gemini.
+# 2. consensus_no_match: agent1=NO_MATCH, agent2=NO_MATCH -> no Gemini, write_final_result with
+#    FinalDecisionType=NO_MATCH, ResolutionMode=judge_script_consensus_no_match, JudgeUsedFlag=false.
+# 3. match_match_conflict: agent1=MATCH(X), agent2=MATCH(Y), X!=Y -> call Gemini, save_judge_agent_decision,
+#    write_final_result with ResolutionMode=judge_llm_match_match_conflict, JudgeUsedFlag=true, JudgeModel=gemini.
+# 4. match_no_match_conflict: agent1=MATCH(X), agent2=NO_MATCH (or vice versa) -> call Gemini,
+#    write_final_result with ResolutionMode=judge_llm_match_no_match_conflict, JudgeUsedFlag=true.
 
 if __name__ == "__main__":
     main()
