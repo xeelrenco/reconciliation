@@ -13,6 +13,15 @@ MOTHERDUCK_DB=my_db
 PROMPT_VERSION=v1
 # Opzionale per 3.3_run_judge.py: PromptVersion da scrivere in output (se vuoto = stesso di PROMPT_VERSION)
 JUDGE_OUTPUT_PROMPT_VERSION=
+
+# 3.3_run_judge.py con Vertex AI / Gemini (path relativo alla cartella degli script)
+VERTEX_CREDENTIALS_PATH=project-5469d685-421b-4832-8bb-50b0d702babb.json
+VERTEX_PROJECT_ID=project-5469d685-421b-4832-8bb
+VERTEX_LOCATION=europe-west1
+# Batch Vertex: bucket GCS obbligatorio; prefix opzionale (es. mdr_judge_batch). Richiede: pip install google-cloud-storage
+VERTEX_BATCH_GCS_BUCKET=il_tuo_bucket_gcs
+VERTEX_BATCH_GCS_PREFIX=
+
 LLM_MODEL=gpt-4o-mini
 
 # Parallelismo e batch

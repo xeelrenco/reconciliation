@@ -3,21 +3,22 @@
 Judge per riconciliazione MDR: legge le decisioni dei due agenti, emette il giudizio finale
 e scrive in MdrReconciliationAgentDecisions e MdrReconciliationResults.
 
-Config: config.txt (MOTHERDUCK_*, OPENAI_API_KEY, PROMPT_VERSION). Vedi config.example.txt.
+Config: config.txt (MOTHERDUCK_*, PROMPT_VERSION, VERTEX_*). Vedi config.example.txt.
 
 Uso in tempo reale (default)
-  Elabora i task ready_for_judge con N worker paralleli.
+  Elabora i task ready_for_judge con N worker paralleli (Vertex AI / Gemini).
   python 3.3_run_judge.py [--prompt-version v1] [--embedding-model ...] [--limit N] [--workers 4] [--output-prompt-version ...] [--model ...]
 
-Uso con Batch API (rate limit separati, ~50% costo)
-  1) Submit: invia i task ready in un batch (elaborazione asincrona, entro 24h).
+Uso con Batch Vertex AI (Gemini batch inference, ~50% costo, GCS obbligatorio)
+  Config: VERTEX_BATCH_GCS_BUCKET (e opzionale VERTEX_BATCH_GCS_PREFIX).
+  1) Submit: carica il JSONL su GCS e crea il job di batch (elaborazione asincrona, entro 24h).
      python 3.3_run_judge.py --batch [--limit N]
-     L'id del batch viene salvato in .judge_last_batch_id.
-  2) Collect: quando il batch è completato, scarica i risultati e scrive in DB.
-     python 3.3_run_judge.py --batch-collect [--batch-id <id>] [--output-prompt-version ...]
+     Job name in .judge_last_batch_id; dettagli in .judge_last_batch_info.json.
+  2) Collect: quando il job è completato, scarica l'output da GCS e scrive in DB.
+     python 3.3_run_judge.py --batch-collect [--batch-id <job_name>] [--output-prompt-version ...]
+     Usa .judge_last_batch_info.json per output_prefix e task_ids (necessario per collect).
 
 Stati JudgeStatus (batch): pending | submitted_{batch_id} | in_batch_{batch_id} | done | error_{batch_id}
-  (solo 'done' senza suffisso; gli altri stati batch hanno _batch_id per tracciare il batch.)
 """
 
 import json
@@ -29,16 +30,23 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import os
 
 import duckdb
-from openai import OpenAI
+from google import genai
+from google.genai.types import CreateBatchJobConfig, JobState
+
+try:
+    from google.cloud import storage as gcs_storage
+except ImportError:
+    gcs_storage = None  # pip install google-cloud-storage
 
 # -----------------------------
 # Config da file (stesso formato degli altri script)
 # -----------------------------
 CONFIG_PATH = Path(__file__).resolve().parent / "config.txt"
 BATCH_ID_FILE = Path(__file__).resolve().parent / ".judge_last_batch_id"
-BATCH_ENDPOINT = "/v1/responses"
+BATCH_INFO_FILE = Path(__file__).resolve().parent / ".judge_last_batch_info.json"
 
 
 def load_config(path: Optional[Path] = None) -> Dict[str, str]:
@@ -74,7 +82,7 @@ def _cfg(key: str, default: Optional[str] = None) -> str:
 # Config
 # --------------------------------------------------
 JUDGE_AGENT_NAME = "judge"
-DEFAULT_MODEL = "gpt-5-mini"
+DEFAULT_MODEL = "gemini-2.5-pro"
 
 DB_SCHEMA = "my_db.mdr_reconciliation"
 TASKS_TABLE = f"{DB_SCHEMA}.MdrReconciliationTasks"
@@ -83,7 +91,18 @@ FINAL_RESULTS_TABLE = f"{DB_SCHEMA}.MdrReconciliationResults"
 AGENT_INPUT_VIEW = f"{DB_SCHEMA}.v_MdrReconciliationAgentInput"
 MDR_VIEW = "my_db.historical_mdr_normalization.v_MdrPreviousRecords_Normalized_All"
 
-client = OpenAI(api_key=_cfg("OPENAI_API_KEY"))
+# Vertex AI / Gemini (google-genai SDK); credentials da config.txt
+_creds_rel = _cfg("VERTEX_CREDENTIALS_PATH")
+if not _creds_rel:
+    raise RuntimeError("Manca VERTEX_CREDENTIALS_PATH nel file di configurazione (config.txt)")
+_creds_path = (Path(__file__).resolve().parent / _creds_rel).as_posix()
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = _creds_path
+
+_genai_client = genai.Client(
+    vertexai=True,
+    project=_cfg("VERTEX_PROJECT_ID"),
+    location=_cfg("VERTEX_LOCATION", "europe-west1"),
+)
 
 # --------------------------------------------------
 # Helpers
@@ -491,8 +510,32 @@ def build_user_prompt(
 
 
 # --------------------------------------------------
-# OpenAI judge call
+# Judge LLM call (Vertex AI / Gemini)
 # --------------------------------------------------
+def _extract_json_payload(raw_text: str) -> str:
+    """
+    Pulisce il testo restituendo solo il JSON (gestisce eventuali code fence o testo extra).
+    """
+    text = raw_text.strip()
+
+    # Caso 1: fenced JSON ```json ... ```
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
+    # Caso 2: testo extra prima/dopo il JSON
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        text = text[start:end + 1]
+
+    return text
+
+
 def call_judge(
     model: str,
     mdr_ctx: Dict[str, Any],
@@ -502,23 +545,17 @@ def call_judge(
 ) -> Dict[str, Any]:
     user_prompt = build_user_prompt(mdr_ctx, candidates, agent1, agent2)
 
-    resp = client.responses.create(
+    # Combina SYSTEM_PROMPT e user_prompt in un unico prompt testuale
+    full_prompt = f"{SYSTEM_PROMPT.strip()}\n\nUSER INPUT:\n{user_prompt}"
+
+    response = _genai_client.models.generate_content(
         model=model,
-        input=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        text={
-            "format": {
-                "type": "json_schema",
-                "name": "mdr_reconciliation_judge",
-                "schema": RESPONSE_SCHEMA,
-                "strict": True,
-            }
-        },
+        contents=full_prompt,
     )
 
-    return json.loads(resp.output_text)
+    raw_text = getattr(response, "text", None) or ""
+    cleaned = _extract_json_payload(raw_text)
+    return json.loads(cleaned)
 
 
 # --------------------------------------------------
@@ -692,40 +729,90 @@ def mark_judge_error(
     """, [status, ts, task_id])
 
 
-def _judge_batch_request_body(model: str, user_prompt: str) -> Dict[str, Any]:
-    """Body for one /v1/responses request in the judge batch JSONL."""
+def _vertex_batch_request_line(full_prompt: str) -> Dict[str, Any]:
+    """One line (request dict) for Vertex batch JSONL: contents + generationConfig."""
     return {
-        "model": model,
-        "input": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": "mdr_reconciliation_judge",
-                "schema": RESPONSE_SCHEMA,
-                "strict": True,
-            }
-        },
+        "request": {
+            "contents": [{"role": "user", "parts": [{"text": full_prompt}]}],
+            "generationConfig": {"temperature": 0, "maxOutputTokens": 2048},
+        }
     }
 
 
-def _extract_output_text_from_batch_response_body(body: Dict[str, Any]) -> Optional[str]:
-    """Extract output text from Responses API batch result response.body."""
-    if not isinstance(body, dict):
+def _extract_text_from_vertex_batch_response(line_obj: Dict[str, Any]) -> Optional[str]:
+    """Extract model output text from Vertex batch output line (response.candidates[0].content.parts[0].text)."""
+    if not isinstance(line_obj, dict):
         return None
-    if body.get("output_text"):
-        return body["output_text"]
-    output = body.get("output") or []
-    for item in output:
-        if not isinstance(item, dict):
-            continue
-        content = item.get("content") or []
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "output_text":
-                return block.get("text")
-    return None
+    resp = line_obj.get("response") or {}
+    candidates = resp.get("candidates") or []
+    if not candidates:
+        return None
+    content = (candidates[0] or {}).get("content") or {}
+    parts = content.get("parts") or []
+    if not parts:
+        return None
+    return (parts[0] or {}).get("text")
+
+
+def _gcs_upload_jsonl(bucket_name: str, blob_path: str, lines: List[str], project_id: str) -> None:
+    """Upload JSONL lines to GCS (requires google-cloud-storage)."""
+    if gcs_storage is None:
+        raise RuntimeError("Batch submit richiede google-cloud-storage: pip install google-cloud-storage")
+    client = gcs_storage.Client(project=project_id)
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(blob_path)
+    content = "\n".join(lines) + "\n" if lines else ""
+    blob.upload_from_string(content, content_type="application/jsonl")
+
+
+def _gcs_download_jsonl_lines(bucket_name: str, prefix: str, project_id: str) -> List[Dict[str, Any]]:
+    """List blobs under prefix, download and parse as JSONL; return list of parsed lines in order."""
+    if gcs_storage is None:
+        raise RuntimeError("Batch collect richiede google-cloud-storage: pip install google-cloud-storage")
+    client = gcs_storage.Client(project=project_id)
+    bucket = client.bucket(bucket_name)
+    blobs = list(bucket.list_blobs(prefix=prefix))
+    blobs.sort(key=lambda b: b.name)
+    lines: List[Dict[str, Any]] = []
+    for blob in blobs:
+        content = blob.download_as_text(encoding="utf-8")
+        for line in content.strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                lines.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    return lines
+
+
+def _gcs_delete_batch_artifacts(
+    bucket_name: str,
+    input_blob: Optional[str],
+    output_prefix: str,
+    project_id: str,
+) -> None:
+    """Delete input JSONL blob and all blobs under output prefix (cleanup after collect)."""
+    if gcs_storage is None:
+        return
+    client = gcs_storage.Client(project=project_id)
+    bucket = client.bucket(bucket_name)
+    deleted = 0
+    if input_blob:
+        try:
+            bucket.blob(input_blob).delete()
+            deleted += 1
+        except Exception as e:
+            print(f"  (cleanup) input blob delete skip: {e}")
+    for blob in bucket.list_blobs(prefix=output_prefix):
+        try:
+            blob.delete()
+            deleted += 1
+        except Exception as e:
+            print(f"  (cleanup) output blob delete skip: {e}")
+    if deleted:
+        print(f"  Bucket cleanup: {deleted} object(s) removed.")
 
 
 def run_batch_submit(
@@ -733,7 +820,16 @@ def run_batch_submit(
     tasks: List[Dict[str, Any]],
     model: str,
 ) -> str:
-    """Build JSONL, upload file, create batch, mark tasks JudgeStatus=submitted_{batch_id}. Returns batch id."""
+    """Build Vertex-format JSONL, upload to GCS, create Vertex batch job, mark tasks submitted_{batch_id}. Returns job name."""
+    bucket = _cfg("VERTEX_BATCH_GCS_BUCKET")
+    if not bucket:
+        raise RuntimeError("Per il batch Vertex serve VERTEX_BATCH_GCS_BUCKET in config.txt")
+    prefix = (_cfg("VERTEX_BATCH_GCS_PREFIX") or "").strip().rstrip("/")
+    if prefix:
+        prefix = prefix + "/"
+    project_id = _cfg("VERTEX_PROJECT_ID")
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
     lines: List[str] = []
     submitted_task_ids: List[str] = []
     for task in tasks:
@@ -752,33 +848,30 @@ def run_batch_submit(
             continue
         mdr_ctx = fetch_mdr_context(con, task["Document_title"])
         user_prompt = build_user_prompt(mdr_ctx, candidates, agent1, agent2)
-        body = _judge_batch_request_body(model, user_prompt)
-        lines.append(json.dumps({
-            "custom_id": task["TaskId"],
-            "method": "POST",
-            "url": BATCH_ENDPOINT,
-            "body": body,
-        }))
+        full_prompt = f"{SYSTEM_PROMPT.strip()}\n\nUSER INPUT:\n{user_prompt}"
+        line_obj = _vertex_batch_request_line(full_prompt)
+        lines.append(json.dumps(line_obj))
         submitted_task_ids.append(task["TaskId"])
     if not lines:
         raise RuntimeError("No valid tasks to submit (missing candidates or agent decisions?).")
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False, encoding="utf-8") as f:
-        for line in lines:
-            f.write(line + "\n")
-        tmp_path = f.name
-    try:
-        with open(tmp_path, "rb") as f:
-            batch_file = client.files.create(file=f, purpose="batch")
-        batch = client.batches.create(
-            input_file_id=batch_file.id,
-            endpoint=BATCH_ENDPOINT,
-            completion_window="24h",
-        )
-        batch_id = batch.id
-    finally:
-        Path(tmp_path).unlink(missing_ok=True)
+
+    input_blob = f"{prefix}in/judge_{run_id}.jsonl"
+    gcs_input_uri = f"gs://{bucket}/{input_blob}"
+    output_prefix = f"{prefix}out/run_{run_id}/"
+    gcs_output_uri = f"gs://{bucket}/{output_prefix}"
+
+    _gcs_upload_jsonl(bucket, input_blob, lines, project_id)
+
+    job = _genai_client.batches.create(
+        model=model,
+        src=gcs_input_uri,
+        config=CreateBatchJobConfig(dest=gcs_output_uri),
+    )
+    job_name = getattr(job, "name", None) or (job.get("name") if isinstance(job, dict) else "")
+    batch_id_short = job_name.split("/")[-1] if job_name and "/" in job_name else (job_name or run_id)
+
     ts = now_ts_naive_utc()
-    status_submitted = f"submitted_{batch_id}"
+    status_submitted = f"submitted_{batch_id_short}"
     for task_id in submitted_task_ids:
         con.execute(f"""
             UPDATE {TASKS_TABLE}
@@ -787,8 +880,29 @@ def run_batch_submit(
                 UpdatedAt = ?
             WHERE TaskId = ?
         """, [status_submitted, ts, task_id])
-    BATCH_ID_FILE.write_text(batch_id, encoding="utf-8")
-    return batch_id
+
+    BATCH_ID_FILE.write_text(job_name, encoding="utf-8")
+    BATCH_INFO_FILE.write_text(
+        json.dumps({
+            "job_name": job_name,
+            "output_prefix": gcs_output_uri,
+            "input_blob": input_blob,
+            "task_ids": submitted_task_ids,
+        }, indent=2),
+        encoding="utf-8",
+    )
+    return job_name
+
+
+def _parse_gcs_uri(gcs_uri: str) -> tuple:
+    """Return (bucket_name, prefix) from gs://bucket/prefix/..."""
+    if not gcs_uri.startswith("gs://"):
+        return "", ""
+    path = gcs_uri[5:].strip("/")  # drop gs:// and trailing slash
+    if "/" not in path:
+        return path, ""
+    bucket_name, _, prefix = path.partition("/")
+    return bucket_name, (prefix + "/" if prefix else "")
 
 
 def run_batch_collect(
@@ -798,105 +912,120 @@ def run_batch_collect(
     output_prompt_version: Optional[str] = None,
     poll_interval: int = 60,
 ) -> None:
-    """Poll batch until completed, then download results and write each to DB."""
+    """Poll Vertex batch job until completed, download output from GCS, write results to DB."""
+    if not BATCH_INFO_FILE.exists():
+        print("Error: .judge_last_batch_info.json non trovato (necessario per output_prefix e task_ids).")
+        return
+    info = json.loads(BATCH_INFO_FILE.read_text(encoding="utf-8"))
+    job_name = (batch_id or "").strip() or info.get("job_name") or ""
+    output_prefix_uri = info.get("output_prefix") or ""
+    input_blob = info.get("input_blob")  # optional, for cleanup (older runs may not have it)
+    task_ids = info.get("task_ids") or []
+    if not job_name:
+        print("Error: job_name non disponibile (--batch-id o .judge_last_batch_info.json).")
+        return
+    if not output_prefix_uri or not task_ids:
+        print("Error: output_prefix o task_ids mancanti in .judge_last_batch_info.json.")
+        return
+
+    batch_id_short = job_name.split("/")[-1] if "/" in job_name else job_name
+
+    _succeeded = getattr(JobState, "JOB_STATE_SUCCEEDED", "JOB_STATE_SUCCEEDED")
+    _terminal_fail = (
+        getattr(JobState, "JOB_STATE_FAILED", "JOB_STATE_FAILED"),
+        getattr(JobState, "JOB_STATE_CANCELLED", "JOB_STATE_CANCELLED"),
+        getattr(JobState, "JOB_STATE_PAUSED", "JOB_STATE_PAUSED"),
+    )
     while True:
-        batch = client.batches.retrieve(batch_id)
-        status = getattr(batch, "status", None) or (batch.get("status") if isinstance(batch, dict) else None)
-        if status == "completed":
+        job = _genai_client.batches.get(name=job_name)
+        state = getattr(job, "state", None) or (job.get("state") if isinstance(job, dict) else None)
+        if state == _succeeded or (isinstance(state, str) and state == "JOB_STATE_SUCCEEDED"):
             break
-        if status in ("failed", "canceled", "expired"):
-            print(f"Batch {batch_id} ended with status={status}. Cannot collect results.")
+        if state in _terminal_fail or (isinstance(state, str) and state in ("JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_PAUSED")):
+            print(f"Batch {job_name} ended with state={state}. Cannot collect results.")
             return
-        print(f"Batch {batch_id} status={status}, waiting {poll_interval}s...")
+        print(f"Batch {job_name} state={state}, waiting {poll_interval}s...")
         time.sleep(poll_interval)
-    status_submitted = f"submitted_{batch_id}"
-    status_in_batch = f"in_batch_{batch_id}"
+
+    status_submitted = f"submitted_{batch_id_short}"
+    status_in_batch = f"in_batch_{batch_id_short}"
     ts = now_ts_naive_utc()
     con.execute(f"""
         UPDATE {TASKS_TABLE}
         SET JudgeStatus = ?, UpdatedAt = ?
         WHERE JudgeStatus = ?
     """, [status_in_batch, ts, status_submitted])
+
+    bucket_name, prefix = _parse_gcs_uri(output_prefix_uri)
+    if not bucket_name:
+        print("Error: output_prefix non valido (gs://bucket/prefix).")
+        return
+    project_id = _cfg("VERTEX_PROJECT_ID")
+    output_lines = _gcs_download_jsonl_lines(bucket_name, prefix, project_id)
+
     saved = 0
     errors = 0
-    output_file_id = getattr(batch, "output_file_id", None) or (batch.get("output_file_id") if isinstance(batch, dict) else None)
-    error_file_id = getattr(batch, "error_file_id", None) or (batch.get("error_file_id") if isinstance(batch, dict) else None)
-    if output_file_id:
-        content = client.files.content(output_file_id).content
-        for line in content.decode("utf-8").strip().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                errors += 1
-                continue
-            custom_id = row.get("custom_id")
-            response = row.get("response") or {}
-            body = response.get("body") if isinstance(response, dict) else {}
-            if not custom_id:
-                errors += 1
-                continue
-            task_id = str(custom_id)
-            output_text = _extract_output_text_from_batch_response_body(body) if body else None
-            if not output_text:
-                mark_judge_error(con, task_id, batch_id=batch_id)
-                errors += 1
-                print(f"  {task_id}: no output text in response")
-                continue
-            try:
-                raw_result = json.loads(output_text)
-            except json.JSONDecodeError as e:
-                mark_judge_error(con, task_id, batch_id=batch_id)
-                errors += 1
-                print(f"  {task_id}: JSON parse error {e}")
-                continue
-            db_row = con.execute(f"""
-                SELECT TaskId, Document_title, PromptVersion, EmbeddingModel
-                FROM {TASKS_TABLE}
-                WHERE TaskId = ?
-            """, [task_id]).fetchone()
-            if not db_row:
-                errors += 1
-                continue
-            task = {"TaskId": db_row[0], "Document_title": db_row[1], "PromptVersion": db_row[2], "EmbeddingModel": db_row[3]}
-            candidates = fetch_candidates_for_task(con, task["Document_title"], task["PromptVersion"], task["EmbeddingModel"])
-            if not candidates:
-                mark_judge_error(con, task_id, batch_id=batch_id)
-                errors += 1
-                continue
-            try:
-                validated = validate_judge_output(raw_result, candidates)
-                save_judge_result(
-                    con=con,
-                    task=task,
-                    model=model,
-                    judge_result=validated,
-                    output_prompt_version=output_prompt_version,
-                )
-                saved += 1
-                print(f"  {task_id} -> {validated['FinalDecisionType']} (saved)")
-            except Exception as e:
-                mark_judge_error(con, task_id, batch_id=batch_id)
-                errors += 1
-                print(f"  {task_id}: validation/save error {e}")
-    if error_file_id:
-        err_content = client.files.content(error_file_id).content
-        for line in err_content.decode("utf-8").strip().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            custom_id = row.get("custom_id")
-            if custom_id:
-                mark_judge_error(con, str(custom_id), batch_id=batch_id)
-                errors += 1
-                print(f"  {custom_id}: batch error (see error file)")
+    for i, line_obj in enumerate(output_lines):
+        task_id = task_ids[i] if i < len(task_ids) else None
+        if not task_id:
+            errors += 1
+            continue
+        if line_obj.get("status"):
+            mark_judge_error(con, task_id, batch_id=batch_id_short)
+            errors += 1
+            print(f"  {task_id}: batch row error (status)")
+            continue
+        output_text = _extract_text_from_vertex_batch_response(line_obj)
+        if not output_text:
+            mark_judge_error(con, task_id, batch_id=batch_id_short)
+            errors += 1
+            print(f"  {task_id}: no output text in response")
+            continue
+        cleaned = _extract_json_payload(output_text)
+        try:
+            raw_result = json.loads(cleaned)
+        except json.JSONDecodeError as e:
+            mark_judge_error(con, task_id, batch_id=batch_id_short)
+            errors += 1
+            print(f"  {task_id}: JSON parse error {e}")
+            continue
+        db_row = con.execute(f"""
+            SELECT TaskId, Document_title, PromptVersion, EmbeddingModel
+            FROM {TASKS_TABLE}
+            WHERE TaskId = ?
+        """, [task_id]).fetchone()
+        if not db_row:
+            errors += 1
+            continue
+        task = {"TaskId": db_row[0], "Document_title": db_row[1], "PromptVersion": db_row[2], "EmbeddingModel": db_row[3]}
+        candidates = fetch_candidates_for_task(con, task["Document_title"], task["PromptVersion"], task["EmbeddingModel"])
+        if not candidates:
+            mark_judge_error(con, task_id, batch_id=batch_id_short)
+            errors += 1
+            continue
+        try:
+            validated = validate_judge_output(raw_result, candidates)
+            save_judge_result(
+                con=con,
+                task=task,
+                model=model,
+                judge_result=validated,
+                output_prompt_version=output_prompt_version,
+            )
+            saved += 1
+            print(f"  {task_id} -> {validated['FinalDecisionType']} (saved)")
+        except Exception as e:
+            mark_judge_error(con, task_id, batch_id=batch_id_short)
+            errors += 1
+            print(f"  {task_id}: validation/save error {e}")
+
     print(f"Batch collect done: {saved} saved, {errors} errors.")
+
+    # Pulizia bucket: rimuovi input JSONL e output di questo run
+    try:
+        _gcs_delete_batch_artifacts(bucket_name, input_blob, prefix, project_id)
+    except Exception as e:
+        print(f"  Bucket cleanup warning: {e}")
 
 
 def process_one_judge_task(
@@ -992,7 +1121,7 @@ def main():
     ap.add_argument("--limit", type=int, default=None, help="Max number of tasks to process (default: no limit, process all ready).")
     ap.add_argument("--workers", type=int, default=4, help="Number of parallel workers (default: 4).")
     ap.add_argument("--output-prompt-version", default=None, help="PromptVersion to write in output (default: same as --prompt-version). Set in config as JUDGE_OUTPUT_PROMPT_VERSION.")
-    ap.add_argument("--model", default=None, help="OpenAI model for judge (default: gpt-5-mini).")
+    ap.add_argument("--model", default=None, help="Vertex AI / Gemini model for judge (default: gemini-2.5-pro).")
     ap.add_argument("--batch", action="store_true", help="Use Batch API: submit ready tasks and exit (collect later with --batch-collect).")
     ap.add_argument("--batch-collect", action="store_true", help="Poll batch until completed and write results to DB. Use --batch-id or .judge_last_batch_id.")
     ap.add_argument("--batch-id", default=None, help="Batch ID for --batch-collect (default: read from .judge_last_batch_id).")
@@ -1007,15 +1136,15 @@ def main():
     ensure_final_results_table(con)
 
     if args.batch_collect:
-        batch_id = (args.batch_id or "").strip() or (BATCH_ID_FILE.read_text(encoding="utf-8").strip() if BATCH_ID_FILE.exists() else "")
-        if not batch_id:
+        job_name = (args.batch_id or "").strip() or (BATCH_ID_FILE.read_text(encoding="utf-8").strip() if BATCH_ID_FILE.exists() else "")
+        if not job_name:
             print("Error: no --batch-id and no .judge_last_batch_id file.")
             con.close()
             return
-        print(f"Collecting results for batch: {batch_id}")
+        print(f"Collecting results for batch: {job_name}")
         run_batch_collect(
             con=con,
-            batch_id=batch_id,
+            batch_id=job_name,
             model=args.model,
             output_prompt_version=args.output_prompt_version,
         )
@@ -1033,10 +1162,10 @@ def main():
             print("No ready tasks for batch.")
             con.close()
             return
-        batch_id = run_batch_submit(con=con, tasks=tasks, model=args.model)
+        job_name = run_batch_submit(con=con, tasks=tasks, model=args.model)
         con.close()
-        print(f"Batch submitted: {batch_id}")
-        print("Run with --batch-collect later to write results to DB (or use --batch-id if you save it).")
+        print(f"Batch submitted: {job_name}")
+        print("Run with --batch-collect later to write results to DB (usa .judge_last_batch_info.json).")
         return
 
     tasks = fetch_ready_tasks(
