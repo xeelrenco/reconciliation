@@ -921,7 +921,9 @@ def _vertex_batch_request_line(full_prompt: str) -> Dict[str, Any]:
     return {
         "request": {
             "contents": [{"role": "user", "parts": [{"text": full_prompt}]}],
-            "generationConfig": {"temperature": 0, "maxOutputTokens": 2048},
+            # Aumentiamo il budget di token per permettere a Gemini
+            # di restituire JSON completi (decisione + reasoning_summary).
+            "generationConfig": {"temperature": 0, "maxOutputTokens": 4096},
         }
     }
 
