@@ -27,6 +27,7 @@ import queue
 import threading
 import tempfile
 import time
+import random
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -40,6 +41,7 @@ from openai import OpenAI
 CONFIG_PATH = Path(__file__).resolve().parent / "config.txt"
 BATCH_ID_FILE = Path(__file__).resolve().parent / ".agent1_last_batch_id"
 BATCH_ENDPOINT = "/v1/responses"
+TEST_TASK_FILE = Path(__file__).resolve().parent / ".recon_test_tasks.json"
 
 
 def load_config(path: Optional[Path] = None) -> Dict[str, str]:
@@ -116,6 +118,47 @@ def ensure_agent_eval_table(con: duckdb.DuckDBPyConnection) -> None:
       PRIMARY KEY (TaskId, AgentName)
     );
     """)
+
+
+def load_or_create_test_tasks(tasks: List[Dict[str, Any]], test_count: int) -> List[Dict[str, Any]]:
+    """
+    Test mode: share a fixed set of TaskId across agents/judge.
+    - If TEST_TASK_FILE exists: filter tasks by stored task_ids.
+    - If it does not exist: randomly pick test_count TaskId from tasks, save them, and return only those.
+    """
+    path = TEST_TASK_FILE
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            ids = set(data.get("task_ids") or [])
+        except Exception:
+            return tasks
+        if not ids:
+            return tasks
+        return [t for t in tasks if t.get("TaskId") in ids]
+
+    if not tasks:
+        return tasks
+
+    shuffled = list(tasks)
+    random.shuffle(shuffled)
+    count = max(1, int(test_count or 1))
+    selected = shuffled[:count]
+    task_ids = [t.get("TaskId") for t in selected if t.get("TaskId")]
+    if not task_ids:
+        return tasks
+
+    payload = {
+        "task_ids": task_ids,
+    }
+    try:
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        print(f"Test mode: created shared task list with {len(task_ids)} TaskId in {path.name}.")
+    except Exception as e:
+        print(f"Warning: could not write test task file {path}: {e}")
+    # Filter original tasks by selected ids to preserve potential ordering
+    ids_set = set(task_ids)
+    return [t for t in tasks if t.get("TaskId") in ids_set]
 
 
 def ensure_agent_top_candidates_table(con: duckdb.DuckDBPyConnection) -> None:
@@ -852,6 +895,8 @@ def main():
     ap.add_argument("--batch", action="store_true", help="Use Batch API: submit pending tasks and exit (collect later with --batch-collect).")
     ap.add_argument("--batch-collect", action="store_true", help="Poll batch until completed and write results to DB. Use --batch-id or .agent1_last_batch_id.")
     ap.add_argument("--batch-id", default=None, help="Batch ID for --batch-collect (default: read from .agent1_last_batch_id).")
+    ap.add_argument("--test-fixed-tasks", action="store_true", help="Test mode: use a shared fixed list of TaskId stored in .recon_test_tasks.json.")
+    ap.add_argument("--test-task-count", type=int, default=150, help="Number of random TaskId to pick when creating the shared test list (default: 150).")
     args = ap.parse_args()
 
     args.prompt_version = args.prompt_version or _cfg("PROMPT_VERSION", "v1")
@@ -880,6 +925,8 @@ def main():
             embedding_model=args.embedding_model,
             limit=args.limit,
         )
+        if args.test_fixed_tasks:
+            tasks = load_or_create_test_tasks(tasks, args.test_task_count)
         if not tasks:
             print("No pending tasks for batch.")
             con.close()
@@ -897,6 +944,9 @@ def main():
         limit=args.limit
     )
     con.close()
+
+    if args.test_fixed_tasks:
+        tasks = load_or_create_test_tasks(tasks, args.test_task_count)
 
     print(f"Pending tasks fetched: {len(tasks)} (workers={args.workers})")
 

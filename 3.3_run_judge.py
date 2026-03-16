@@ -22,6 +22,7 @@ import queue
 import threading
 import tempfile
 import time
+import random
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -42,6 +43,7 @@ except ImportError:
 CONFIG_PATH = Path(__file__).resolve().parent / "config.txt"
 BATCH_ID_FILE = Path(__file__).resolve().parent / ".judge_last_batch_id"
 BATCH_INFO_FILE = Path(__file__).resolve().parent / ".judge_last_batch_info.json"
+TEST_TASK_FILE = Path(__file__).resolve().parent / ".recon_test_tasks.json"
 
 
 def load_config(path: Optional[Path] = None) -> Dict[str, str]:
@@ -71,6 +73,46 @@ def get_config() -> Dict[str, str]:
 
 def _cfg(key: str, default: Optional[str] = None) -> str:
     return get_config().get(key, default or "").strip()
+
+
+def load_or_create_test_tasks(tasks: List[Dict[str, Any]], test_count: int) -> List[Dict[str, Any]]:
+    """
+    Test mode: share a fixed set of TaskId across agents/judge.
+    - If TEST_TASK_FILE exists: filter tasks by stored task_ids.
+    - If it does not exist: randomly pick test_count TaskId from tasks, save them, and return only those.
+    """
+    path = TEST_TASK_FILE
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            ids = set(data.get("task_ids") or [])
+        except Exception:
+            return tasks
+        if not ids:
+            return tasks
+        return [t for t in tasks if t.get("TaskId") in ids]
+
+    if not tasks:
+        return tasks
+
+    shuffled = list(tasks)
+    random.shuffle(shuffled)
+    count = max(1, int(test_count or 1))
+    selected = shuffled[:count]
+    task_ids = [t.get("TaskId") for t in selected if t.get("TaskId")]
+    if not task_ids:
+        return tasks
+
+    payload = {
+        "task_ids": task_ids,
+    }
+    try:
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        print(f"Test mode: created shared task list with {len(task_ids)} TaskId in {path.name}.")
+    except Exception as e:
+        print(f"Warning: could not write test task file {path}: {e}")
+    ids_set = set(task_ids)
+    return [t for t in tasks if t.get("TaskId") in ids_set]
 
 
 # --------------------------------------------------
@@ -501,10 +543,7 @@ RESPONSE_SCHEMA = {
             "type": "string",
             "enum": ["MATCH", "NO_MATCH", "MANUAL_REVIEW"]
         },
-        "selected_titlekey": {
-            "type": ["string", "null"]
-        },
-        "selected_raci_title": {
+        "selected_candidate_id": {
             "type": ["string", "null"]
         },
         "confidence": {
@@ -525,8 +564,7 @@ RESPONSE_SCHEMA = {
     },
     "required": [
         "decision_type",
-        "selected_titlekey",
-        "selected_raci_title",
+        "selected_candidate_id",
         "confidence",
         "reasoning_summary",
         "resolution_mode"
@@ -540,21 +578,85 @@ Disagreement cases:
 - match_match_conflict: both agents chose MATCH but selected different candidates (X vs Y).
 - match_no_match_conflict: one agent chose MATCH, the other NO_MATCH.
 
-Your task: resolve the conflict and decide the final outcome. You do not re-evaluate from scratch; you use the agents' decisions and their top-3 candidates as the primary focus, and the full top-50 list only to verify whether a better candidate was missed.
+Your task:
+Resolve the conflict and decide the final outcome. You do NOT re-evaluate from scratch; you use the agents' decisions and their top-3 candidates as the primary focus, and the full top-50 list only to verify whether a better candidate was missed.
 
 Allowed outcomes:
 - MATCH: one candidate is clearly the best; choose only from the provided top-50.
 - NO_MATCH: no candidate is sufficiently credible.
 - MANUAL_REVIEW: genuine ambiguity between plausible candidates or insufficient evidence to safely accept or reject.
 
-Rules:
-- Primary focus: the two agents' top-3 candidate lists. Full top-50 is the complete verification context.
-- You may select only from the provided top-50 candidates. Similarity scores are retrieval evidence only; metadata and semantics matter more than lexical overlap.
-- selected_titlekey and selected_raci_title must be null when decision_type is NO_MATCH or MANUAL_REVIEW.
-- confidence between 0 and 1. reasoning_summary brief and factual (max 100 words).
-- resolution_mode must reflect how you resolved the conflict: match_match_conflict_resolved, match_no_match_conflict_resolved, no_credible_candidate, or ambiguous_candidates.
+STRICT FORMAT RULES (CRITICAL):
 
-Output JSON only with: decision_type, selected_titlekey, selected_raci_title, confidence, resolution_mode, reasoning_summary.
+1) Candidate IDs:
+- In the FULL TOP50 CANDIDATES section, each candidate is identified by an ID in square brackets, e.g. [T01], [T02], ..., in the same order as they appear.
+- When decision_type is MATCH, you MUST select exactly one of these IDs and return it as "selected_candidate_id" in JSON (e.g. "T02").
+- When decision_type is NO_MATCH or MANUAL_REVIEW, "selected_candidate_id" MUST be null.
+
+2) General decision rules:
+- Primary focus: the two agents' top-3 candidate lists. The FULL TOP50 is the complete verification context.
+- You may select ONLY from the provided top-50 candidates (via their IDs). Never invent candidates.
+- SimilarityScore is retrieval evidence only; metadata and semantic meaning matter more than lexical overlap.
+- Choose MATCH only if one candidate is clearly superior to all others and semantically consistent with the MDR record and its metadata.
+- Choose NO_MATCH when the best available candidates are still weak, generic, metadata-incompatible, or not clearly equivalent.
+- Choose MANUAL_REVIEW only when there is real ambiguity between plausible candidates or insufficient evidence to safely accept or reject one.
+
+3) Output constraints:
+- confidence must be between 0 and 1.
+- reasoning_summary must be brief and factual (max 80 words). Avoid using " characters inside the text when possible.
+- resolution_mode must be one of:
+  - match_match_conflict_resolved
+  - match_no_match_conflict_resolved
+  - no_credible_candidate
+  - ambiguous_candidates
+
+Output JSON ONLY with the following fields:
+- decision_type
+- selected_candidate_id
+- confidence
+- resolution_mode
+- reasoning_summary
+
+EXAMPLES (VERY IMPORTANT):
+
+Example 1 – MATCH with candidate ID
+
+Suppose in FULL TOP50 CANDIDATES you see:
+
+----
+[T02]
+Rank: 5
+SimilarityScore: 0.9231
+TitleKey: vendor dwgs and documents for centrifugal compressor for process service
+RaciTitle: VENDOR DWGS AND DOCUMENTS FOR CENTRIFUGAL COMPRESSOR FOR PROCESS SERVICE
+EffectiveDescription: ...
+DisciplineName: Mechanical
+TypeName: Vendor Drawings
+...
+
+If you decide that THIS is the best candidate, your JSON MUST contain:
+
+{
+  "decision_type": "MATCH",
+  "selected_candidate_id": "T02",
+  "confidence": 0.85,
+  "resolution_mode": "match_match_conflict_resolved",
+  "reasoning_summary": "Short, factual explanation (max 80 words, no extra quotes if possible)."
+}
+
+Example 2 – NO_MATCH with null candidate
+
+If, after checking the agents' top-3 lists and the FULL TOP50 CANDIDATES, there is no single clearly credible candidate, you MUST output:
+
+{
+  "decision_type": "NO_MATCH",
+  "selected_candidate_id": null,
+  "confidence": 0.0,
+  "resolution_mode": "no_credible_candidate",
+  "reasoning_summary": "Explain briefly why no candidate is sufficiently credible."
+}
+
+Do NOT put any candidate title or description in selected_candidate_id. It must be either one of the IDs [T01]...[T50] (without brackets, e.g. "T02") or null.
 """
 
 
@@ -612,13 +714,15 @@ def build_user_prompt(
 
     blocks.append("FULL TOP50 CANDIDATES")
     blocks.append("(Use for verification only; primary focus is the agents' top-3 lists above.)")
-    for c in candidates:
+    for idx, c in enumerate(candidates, 1):
+        cid = f"T{idx:02d}"
         selected_by = []
         if str(c["TitleKey"]) == str(agent1.get("SelectedTitleKey")):
             selected_by.append("Agent1")
         if str(c["TitleKey"]) == str(agent2.get("SelectedTitleKey")):
             selected_by.append("Agent2")
         blocks.append("----")
+        blocks.append(f"[{cid}]")
         blocks.append(f"Rank: {c['Rank']}")
         blocks.append(f"SimilarityScore: {float(c['Similarity']):.4f}")
         blocks.append(f"SelectedByAgents: {', '.join(selected_by) if selected_by else 'None'}")
@@ -689,11 +793,14 @@ def call_judge(
 # Validation
 # --------------------------------------------------
 def validate_judge_output(result: Dict[str, Any], candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
-    candidate_map = {norm(c["TitleKey"]): c for c in candidates}
+    # Build ID -> candidate map (T01, T02, ...) in the same order as candidates.
+    id_map: Dict[str, Dict[str, Any]] = {}
+    for idx, c in enumerate(candidates, 1):
+        cid = f"T{idx:02d}"
+        id_map[cid] = c
 
     decision_type = result["decision_type"]
-    selected_titlekey = result["selected_titlekey"]
-    selected_raci_title = result["selected_raci_title"]
+    selected_candidate_id = result.get("selected_candidate_id")
     confidence = float(result["confidence"])
     reasoning_summary = norm(result["reasoning_summary"])
     resolution_mode = norm(result["resolution_mode"])
@@ -711,6 +818,9 @@ def validate_judge_output(result: Dict[str, Any], candidates: List[Dict[str, Any
         resolution_mode = "no_credible_candidate" if decision_type == "NO_MATCH" else "ambiguous_candidates"
 
     if decision_type in ("NO_MATCH", "MANUAL_REVIEW"):
+        # In questi casi selected_candidate_id deve essere null
+        if selected_candidate_id not in (None, "null"):
+            raise ValueError("NO_MATCH/MANUAL_REVIEW require selected_candidate_id = null")
         return {
             "FinalDecisionType": decision_type,
             "FinalTitleKey": None,
@@ -723,22 +833,20 @@ def validate_judge_output(result: Dict[str, Any], candidates: List[Dict[str, Any
     if decision_type != "MATCH":
         raise ValueError(f"Invalid decision_type: {decision_type}")
 
-    if not selected_titlekey:
-        raise ValueError("MATCH requires selected_titlekey")
+    if not selected_candidate_id:
+        raise ValueError("MATCH requires selected_candidate_id")
 
-    selected_titlekey = norm(selected_titlekey)
-    if selected_titlekey not in candidate_map:
-        raise ValueError(f"SelectedTitleKey not in provided candidates: {selected_titlekey}")
+    if selected_candidate_id not in id_map:
+        raise ValueError(f"selected_candidate_id not in candidates: {selected_candidate_id}")
 
-    candidate = candidate_map[selected_titlekey]
-
-    if not selected_raci_title:
-        selected_raci_title = norm(candidate["RaciTitle"])
+    candidate = id_map[selected_candidate_id]
+    final_titlekey = norm(candidate["TitleKey"])
+    final_racititle = norm(candidate["RaciTitle"])
 
     return {
         "FinalDecisionType": "MATCH",
-        "FinalTitleKey": selected_titlekey,
-        "FinalRaciTitle": norm(selected_raci_title),
+        "FinalTitleKey": final_titlekey,
+        "FinalRaciTitle": final_racititle,
         "FinalConfidence": confidence,
         "FinalReason": reasoning_summary or "Judge selected the best supported candidate.",
         "ResolutionMode": resolution_mode if resolution_mode in (
@@ -1365,6 +1473,8 @@ def main():
     ap.add_argument("--batch", action="store_true", help="Use Batch API: submit ready tasks and exit (collect later with --batch-collect).")
     ap.add_argument("--batch-collect", action="store_true", help="Poll batch until completed and write results to DB. Use --batch-id or .judge_last_batch_id.")
     ap.add_argument("--batch-id", default=None, help="Batch ID for --batch-collect (default: read from .judge_last_batch_id).")
+    ap.add_argument("--test-fixed-tasks", action="store_true", help="Test mode: use a shared fixed list of TaskId stored in .recon_test_tasks.json.")
+    ap.add_argument("--test-task-count", type=int, default=150, help="Number of random TaskId to pick when creating the shared test list (default: 150).")
     args = ap.parse_args()
 
     args.prompt_version = args.prompt_version or _cfg("PROMPT_VERSION", "v1")
@@ -1403,6 +1513,8 @@ def main():
             print("No ready tasks for batch.")
             con.close()
             return
+        if args.test_fixed_tasks:
+            tasks = load_or_create_test_tasks(tasks, args.test_task_count)
         job_name = run_batch_submit(
             con=con, tasks=tasks, model=args.model, output_prompt_version=args.output_prompt_version
         )
@@ -1419,6 +1531,9 @@ def main():
         limit=args.limit
     )
     con.close()
+
+    if args.test_fixed_tasks:
+        tasks = load_or_create_test_tasks(tasks, args.test_task_count)
 
     if args.output_prompt_version:
         print(f"Ready tasks fetched for judge: {len(tasks)} (workers={args.workers}, output PromptVersion={args.output_prompt_version})")
