@@ -815,7 +815,10 @@ def validate_judge_output(result: Dict[str, Any], candidates: List[Dict[str, Any
         "no_credible_candidate", "ambiguous_candidates"
     )
     if resolution_mode not in valid_resolution_modes:
-        resolution_mode = "no_credible_candidate" if decision_type == "NO_MATCH" else "ambiguous_candidates"
+        raise ValueError(
+            f"resolution_mode must be one of {valid_resolution_modes}, got: {resolution_mode!r}. "
+            "Invalid judge output: do not fallback; mark task as error."
+        )
 
     if decision_type in ("NO_MATCH", "MANUAL_REVIEW"):
         # In questi casi selected_candidate_id deve essere null
@@ -849,10 +852,7 @@ def validate_judge_output(result: Dict[str, Any], candidates: List[Dict[str, Any
         "FinalRaciTitle": final_racititle,
         "FinalConfidence": confidence,
         "FinalReason": reasoning_summary or "Judge selected the best supported candidate.",
-        "ResolutionMode": resolution_mode if resolution_mode in (
-            "match_match_conflict_resolved", "match_no_match_conflict_resolved",
-            "no_credible_candidate", "ambiguous_candidates"
-        ) else "match_match_conflict_resolved",
+        "ResolutionMode": resolution_mode,
     }
 
 
@@ -888,11 +888,6 @@ def resolve_conflict_with_gemini(
     validated["ResolvedBy"] = "judge_script"
     validated["JudgeUsedFlag"] = True
     validated["JudgeModel"] = "gemini"
-    if validated.get("ResolutionMode") not in (
-        "match_match_conflict_resolved", "match_no_match_conflict_resolved",
-        "no_credible_candidate", "ambiguous_candidates"
-    ):
-        validated["ResolutionMode"] = resolution_mode
     return validated
 
 
@@ -1250,8 +1245,6 @@ def run_batch_collect(
     output_prefix_uri = info.get("output_prefix") or ""
     input_blob = info.get("input_blob")  # optional, for cleanup (older runs may not have it)
     task_ids = info.get("task_ids") or []
-    conflict_tasks = info.get("conflict_tasks") or []
-    resolution_mode_by_task = {ct["task_id"]: ct["resolution_mode"] for ct in conflict_tasks if isinstance(ct, dict) and ct.get("task_id")}
     if not job_name:
         print("Error: job_name non disponibile (--batch-id o .judge_last_batch_info.json).")
         return
@@ -1336,11 +1329,6 @@ def run_batch_collect(
             continue
         try:
             validated = validate_judge_output(raw_result, candidates)
-            if validated.get("ResolutionMode") not in (
-                "match_match_conflict_resolved", "match_no_match_conflict_resolved",
-                "no_credible_candidate", "ambiguous_candidates"
-            ):
-                validated["ResolutionMode"] = resolution_mode_by_task.get(task_id, RESOLUTION_LLM_MATCH_NO_MATCH)
             validated["ResolvedBy"] = "judge_script"
             validated["JudgeUsedFlag"] = True
             validated["JudgeModel"] = "gemini"
