@@ -793,6 +793,25 @@ def call_judge(
 # --------------------------------------------------
 # Validation
 # --------------------------------------------------
+def _expand_candidate_ids_in_reasoning(text: str, id_map: Dict[str, Dict[str, Any]]) -> str:
+    """
+    Replace candidate references like [T02] or T02 in reasoning text with the
+    corresponding candidate title for readability in final reports.
+    """
+    if not text:
+        return text
+
+    def _label_for(cid: str) -> str:
+        c = id_map.get(cid.upper()) or {}
+        label = norm(c.get("RaciTitle")) or norm(c.get("TitleKey")) or cid
+        return f"[{label}]"
+
+    # First replace bracketed IDs, then bare IDs.
+    text = re.sub(r"\[(T\d{2})\]", lambda m: _label_for(m.group(1)), text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(T\d{2})\b", lambda m: _label_for(m.group(1)), text, flags=re.IGNORECASE)
+    return text
+
+
 def validate_judge_output(result: Dict[str, Any], candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
     # Build ID -> candidate map (T01, T02, ...) in the same order as candidates.
     id_map: Dict[str, Dict[str, Any]] = {}
@@ -805,6 +824,7 @@ def validate_judge_output(result: Dict[str, Any], candidates: List[Dict[str, Any
     confidence = float(result["confidence"])
     reasoning_summary = norm(result["reasoning_summary"])
     resolution_mode = norm(result["resolution_mode"])
+    reasoning_summary = _expand_candidate_ids_in_reasoning(reasoning_summary, id_map)
 
     if confidence < 0:
         confidence = 0.0
