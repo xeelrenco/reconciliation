@@ -1,13 +1,15 @@
 """
-renco_export_v2.py
-==================
-Genera l'Excel MDR riconciliazione con esattamente le colonne
-del file originale + motivazioni GPT e Claude.
+3.3.1_generate_review_with_top3.py
+==================================
+Genera l'Excel MDR riconciliazione con motivazioni, scelta agente e top 3 candidati
+per GPT e Claude.
 
 Colonne output:
   # | Titolo MDR (storico) | N. Documento MDR | Progetto MDR |
-  Esito | Titolo RACI Abbinato | Confidence |
-  Motivazione della Scelta | Motivazione GPT | Motivazione Claude
+  Esito | Titolo RACI Abbinato |
+  Motivazione della Scelta finale (judge) |
+  GPT — Scelta | Motivazione GPT | GPT — Top1/Top2/Top3 |
+  Claude — Scelta | Motivazione Claude | Claude — Top1/Top2/Top3
 
 Dipendenze:
     pip install duckdb openpyxl
@@ -18,7 +20,7 @@ Configurazione:
     Fallback: variabili d'ambiente MOTHERDUCK_TOKEN / MOTHERDUCK_DB.
 
 Uso:
-    python 3.3.1_generate_review_report.py
+    python 3.3.1_generate_review_with_top3.py
 """
 
 import os
@@ -33,7 +35,7 @@ from openpyxl.utils import get_column_letter
 # CONFIG
 # ──────────────────────────────────────────────────────────────
 PROMPT_VERSION   = "v1.2"
-OUTPUT_FILE      = "renco_riconciliazione_report.xlsx"
+OUTPUT_FILE      = "renco_riconciliazione_report_with_top3.xlsx"
 
 CONFIG_PATH = Path(__file__).resolve().parent / "config.txt"
 
@@ -70,13 +72,22 @@ def _norm(s):
 # ──────────────────────────────────────────────────────────────
 SQL_RESULTS = f"""
 SELECT
+    t.TaskId,
     t.Document_title                                              AS titolo_mdr,
     r.FinalDecisionType                                           AS esito,
     COALESCE(r.FinalRaciTitle, '—')                               AS raci_abbinato,
     ROUND(r.FinalConfidence, 3)                                   AS confidence,
     r.FinalReason                                                 AS motivazione_finale,
-    MAX(CASE WHEN d.AgentName = 'gpt5mini' THEN d.ReasoningSummary END) AS motivazione_gpt,
-    MAX(CASE WHEN d.AgentName = 'claude'   THEN d.ReasoningSummary END) AS motivazione_claude
+    -- Motivazione complessiva per agente
+    MAX(CASE WHEN d.AgentName = 'gpt5mini' THEN d.ReasoningSummary    END) AS motivazione_gpt,
+    MAX(CASE WHEN d.AgentName = 'claude'   THEN d.ReasoningSummary    END) AS motivazione_claude,
+    -- Scelta agente (DecisionType + SelectedRaciTitle) e confidence interna
+    MAX(CASE WHEN d.AgentName = 'gpt5mini' THEN d.DecisionType        END) AS gpt_decision,
+    MAX(CASE WHEN d.AgentName = 'gpt5mini' THEN d.SelectedRaciTitle   END) AS gpt_selected_raci,
+    MAX(CASE WHEN d.AgentName = 'gpt5mini' THEN ROUND(d.Confidence,3) END) AS gpt_conf,
+    MAX(CASE WHEN d.AgentName = 'claude'   THEN d.DecisionType        END) AS claude_decision,
+    MAX(CASE WHEN d.AgentName = 'claude'   THEN d.SelectedRaciTitle   END) AS claude_selected_raci,
+    MAX(CASE WHEN d.AgentName = 'claude'   THEN ROUND(d.Confidence,3) END) AS claude_conf
 FROM my_db.mdr_reconciliation.MdrReconciliationResults r
 JOIN my_db.mdr_reconciliation.MdrReconciliationTasks t
     ON t.TaskId = r.TaskId
@@ -85,34 +96,79 @@ LEFT JOIN my_db.mdr_reconciliation.MdrReconciliationAgentDecisions d
    AND d.AgentName IN ('gpt5mini', 'claude')
 WHERE r.PromptVersion = '{PROMPT_VERSION}'
 GROUP BY
-    t.Document_title, r.FinalDecisionType, r.FinalRaciTitle,
+    t.TaskId, t.Document_title, r.FinalDecisionType, r.FinalRaciTitle,
     r.FinalConfidence, r.FinalReason
 ORDER BY r.FinalDecisionType, t.Document_title
 """
 
-SQL_RAW = """
+SQL_CANDIDATES = f"""
 SELECT
-    Document_title,
-    Document_number,
-    Mdr_code_name_ref
+    TaskId,
+    AgentName,
+    CandidateRankWithinAgent                    AS rank,
+    COALESCE(RaciTitle, '—')                    AS raci_title,
+    ROUND(CandidateConfidence, 3)               AS conf,
+    COALESCE(WhyPlausible, '')                  AS why
+FROM my_db.mdr_reconciliation.MdrReconciliationAgentTopCandidates
+WHERE PromptVersion = '{PROMPT_VERSION}'
+  AND CandidateRankWithinAgent <= 3
+ORDER BY TaskId, AgentName, CandidateRankWithinAgent
+"""
+
+SQL_RAW = """
+SELECT Document_title, Document_number, Mdr_code_name_ref
 FROM my_db.historical_mdr_normalization.MdrPreviousRecordsRaw
 ORDER BY Document_number
 """
 
 
 def build_raw_lookup(raw_rows):
-    """
-    Costruisce dict {titolo_normalizzato -> (Document_number, Mdr_code_name_ref)}.
-    Normalizzazione in Python con re.sub — gestisce spazi multipli, newline, tab.
-    Mantiene solo il primo match per titolo (ORDER BY Document_number garantisce
-    che sia il numero più basso/alfabetico).
-    """
+    """Dict {titolo_normalizzato -> (Document_number, Mdr_code_name_ref)} — primo match per titolo."""
     lookup = {}
     for title, doc_num, progetto in raw_rows:
         key = _norm(title)
         if key and key not in lookup:
             lookup[key] = (doc_num, progetto)
     return lookup
+
+
+def build_candidate_lookup(cand_rows):
+    """
+    Dict {TaskId -> {
+        'gpt': [(raci_title, conf, why), ...],   # top 3 ordinati per rank
+        'claude': [(raci_title, conf, why), ...]
+    }}
+    """
+    lookup = {}
+    for task_id, agent, rank, raci_title, conf, why in cand_rows:
+        agent_key = "gpt" if agent == "gpt5mini" else "claude"
+        if task_id not in lookup:
+            lookup[task_id] = {"gpt": [], "claude": []}
+        lookup[task_id][agent_key].append((raci_title, conf, why))
+    return lookup
+
+
+def fmt_candidate(triple):
+    """Formatta un candidato come stringa leggibile nella cella."""
+    if not triple:
+        return "—"
+    raci_title, conf, why = triple
+    why_str  = (why or "").strip()
+    title = (raci_title or "—").strip()
+    if not why_str:
+        return f"TITOLO:\n{title}\n\nNOTA:\n—"
+    return f"TITOLO:\n{title}\n\nNOTA:\n{why_str}"
+
+
+def fmt_decision(decision, raci, conf):
+    """Formatta la scelta di un agente come stringa cella."""
+    if not decision:
+        return "—"
+    if decision == "NO_MATCH":
+        return "DECISIONE: NO MATCH\n\nNessun titolo selezionato"
+    # MATCH
+    raci_str = raci or "—"
+    return f"DECISIONE: MATCH\n\nTITOLO SCELTO:\n{raci_str}"
 
 
 # ──────────────────────────────────────────────────────────────
@@ -124,6 +180,10 @@ BORDER = "CBD5E1"
 
 ESITO_BG = {"MATCH": "D1FAE5", "NO_MATCH": "FEE2E2", "MANUAL_REVIEW": "FEF3C7"}
 ESITO_FG = {"MATCH": "065F46", "NO_MATCH": "7F1D1D", "MANUAL_REVIEW": "92400E"}
+
+# Sfondo leggero per le colonne candidati
+GPT_BG    = "EFF6FF"   # blu molto chiaro
+CLAUDE_BG = "F5F3FF"   # viola molto chiaro
 
 thin      = Side(style="thin",   color=BORDER)
 thick_top = Side(style="medium", color="334155")
@@ -147,7 +207,7 @@ def _align(h="left", wrap=True, v="top"):
 
 
 # ──────────────────────────────────────────────────────────────
-# BUILD EXCEL
+# STRUTTURA COLONNE
 # ──────────────────────────────────────────────────────────────
 HEADERS = [
     "#",
@@ -156,13 +216,45 @@ HEADERS = [
     "Progetto MDR",
     "Esito",
     "Titolo RACI Abbinato",
-    "Confidence",
     "Motivazione della Scelta Finale(giudice Gemini)",
-    "Motivazione Agente1 GPT",
-    "Motivazione Agente2 Claude",
+    "GPT — Scelta",
+    "Motivazione GPT",
+    # top candidati GPT
+    "GPT — CandidatoTop 1",
+    "GPT — Candidato Top 2",
+    "GPT — Candidato Top 3",
+    "Claude — Scelta",
+    "Motivazione Claude",
+    # top candidati Claude
+    "Claude — Candidato Top 1",
+    "Claude — Candidato Top 2",
+    "Claude — Candidato Top 3",
 ]
 
-COL_WIDTHS = [5, 68, 28, 32, 14, 58, 12, 70, 70, 70]
+COL_WIDTHS = [
+    5,   # #
+    68,  # Titolo MDR
+    28,  # N. Documento
+    32,  # Progetto
+    14,  # Esito
+    58,  # RACI abbinato
+    70,  # Motivazione finale
+    45,  # GPT Scelta
+    70,  # Motivazione GPT
+    45,  # GPT Top1
+    45,  # GPT Top2
+    45,  # GPT Top3
+    45,  # Claude Scelta
+    70,  # Motivazione Claude
+    45,  # Claude Top1
+    45,  # Claude Top2
+    45,  # Claude Top3
+]
+
+# colonne (1-indexed) con sfondo GPT
+GPT_COLS    = {8, 9, 10, 11, 12}
+# colonne con sfondo Claude
+CLAUDE_COLS = {13, 14, 15, 16, 17}
 
 SHEET_CONFIGS = [
     ("Riconciliazione Completa", None),
@@ -201,11 +293,16 @@ def _build_sheet(ws, rows, title):
     ws["A1"].alignment = _align(h="left", v="center", wrap=False)
     ws.row_dimensions[1].height = 26
 
-    # Riga 2 — header colonne
+    # Riga 2 — header colonne con gruppi colorati
     for ci, (h, w) in enumerate(zip(HEADERS, COL_WIDTHS), 1):
         c = ws.cell(row=2, column=ci, value=h)
+        if ci in GPT_COLS:
+            c.fill = _fill("1E40AF")   # blu scuro per header GPT
+        elif ci in CLAUDE_COLS:
+            c.fill = _fill("5B21B6")   # viola scuro per header Claude
+        else:
+            c.fill = _fill("1A2E42")
         c.font      = Font(name="Arial", bold=True, size=9, color=WHITE)
-        c.fill      = _fill("1A2E42")
         c.alignment = _align(h="center", v="center", wrap=True)
         c.border    = _border()
         ws.column_dimensions[get_column_letter(ci)].width = w
@@ -221,6 +318,9 @@ def _build_sheet(ws, rows, title):
         fg    = ESITO_FG.get(esito, "1A1A2E")
         top   = prev_esito is not None and prev_esito != esito
 
+        gpt_cands    = row.get("gpt_candidates", [None, None, None])
+        claude_cands = row.get("claude_candidates", [None, None, None])
+
         vals = [
             idx,
             row["titolo_mdr"],
@@ -228,33 +328,46 @@ def _build_sheet(ws, rows, title):
             row["progetto"]         or "—",
             esito,
             row["raci_abbinato"],
-            conf,
             row["motivazione_finale"] or "—",
+            fmt_decision(row["gpt_decision"], row["gpt_selected_raci"], row["gpt_conf"]),
             row["motivazione_gpt"]    or "—",
+            fmt_candidate(gpt_cands[0] if len(gpt_cands) > 0 else None),
+            fmt_candidate(gpt_cands[1] if len(gpt_cands) > 1 else None),
+            fmt_candidate(gpt_cands[2] if len(gpt_cands) > 2 else None),
+            fmt_decision(row["claude_decision"], row["claude_selected_raci"], row["claude_conf"]),
             row["motivazione_claude"] or "—",
+            fmt_candidate(claude_cands[0] if len(claude_cands) > 0 else None),
+            fmt_candidate(claude_cands[1] if len(claude_cands) > 1 else None),
+            fmt_candidate(claude_cands[2] if len(claude_cands) > 2 else None),
         ]
 
         for ci, val in enumerate(vals, 1):
             c = ws.cell(row=r, column=ci, value=val)
-            c.border    = _border(top)
-            c.fill      = _fill(bg)
+            c.border = _border(top)
+
+            if ci in GPT_COLS:
+                c.fill = _fill(GPT_BG)
+                c.font = _font(size=9, color="1E3A8A")
+            elif ci in CLAUDE_COLS:
+                c.fill = _fill(CLAUDE_BG)
+                c.font = _font(size=9, color="4C1D95")
+            elif ci == 5:
+                c.fill = _fill(bg)
+                c.font = Font(name="Arial", size=9, bold=True, color=fg)
+            else:
+                c.fill = _fill(bg)
+                c.font = _font(size=9)
+
             c.alignment = _align(
-                h="center" if ci in (1, 5, 7) else "left",
+                h="center" if ci in (1, 5) else "left",
                 wrap=True, v="top",
             )
-            c.font = (
-                Font(name="Arial", size=9, bold=True, color=fg)
-                if ci == 5
-                else _font(size=9)
-            )
-            if ci == 7 and conf is not None:
-                c.number_format = "0.000"
 
-        ws.row_dimensions[r].height = 60
+        ws.row_dimensions[r].height = 95
         prev_esito = esito
 
     ws.auto_filter.ref = f"A2:{get_column_letter(len(HEADERS))}{total + 2}"
-    ws.freeze_panes    = "A3"
+    ws.freeze_panes    = "B3"   # congela # e Titolo MDR
 
 
 # ──────────────────────────────────────────────────────────────
@@ -267,27 +380,40 @@ def main():
     print("Query risultati riconciliazione...")
     raw_results = con.execute(SQL_RESULTS).fetchall()
     col_names = [
-        "titolo_mdr", "esito", "raci_abbinato", "confidence",
+        "task_id", "titolo_mdr", "esito", "raci_abbinato", "confidence",
         "motivazione_finale", "motivazione_gpt", "motivazione_claude",
+        "gpt_decision", "gpt_selected_raci", "gpt_conf",
+        "claude_decision", "claude_selected_raci", "claude_conf",
     ]
     rows = [dict(zip(col_names, r)) for r in raw_results]
     print(f"  {len(rows)} task recuperati.")
 
+    print("Query top candidati per agente...")
+    cand_raw  = con.execute(SQL_CANDIDATES).fetchall()
+    cand_look = build_candidate_lookup(cand_raw)
+    print(f"  {len(cand_look)} task con candidati.")
+
     print("Query tabella raw per numeri documento e progetti...")
     raw_raw = con.execute(SQL_RAW).fetchall()
-    lookup  = build_raw_lookup(raw_raw)
-    print(f"  {len(lookup)} titoli unici nella raw.")
+    raw_look = build_raw_lookup(raw_raw)
+    print(f"  {len(raw_look)} titoli unici nella raw.")
     con.close()
 
-    # Arricchisci ogni riga con numero documento e progetto (join in Python)
+    # Arricchisci ogni riga
     not_found = 0
     for row in rows:
+        # Numero documento e progetto (join Python)
         key = _norm(row["titolo_mdr"])
-        doc_num, progetto = lookup.get(key, (None, None))
+        doc_num, progetto = raw_look.get(key, (None, None))
         row["numero_documento"] = doc_num
         row["progetto"]         = progetto
         if doc_num is None:
             not_found += 1
+
+        # Top candidati
+        task_cands = cand_look.get(row["task_id"], {"gpt": [], "claude": []})
+        row["gpt_candidates"]    = task_cands["gpt"]
+        row["claude_candidates"] = task_cands["claude"]
 
     if not_found:
         print(f"  ⚠  {not_found} titoli senza corrispondenza nella raw.")
