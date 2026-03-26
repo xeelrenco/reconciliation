@@ -23,6 +23,7 @@ import threading
 import tempfile
 import time
 import random
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -1046,6 +1047,29 @@ def _extract_text_from_vertex_batch_response(line_obj: Dict[str, Any]) -> Option
     return (parts[0] or {}).get("text")
 
 
+def _extract_task_id_from_vertex_batch_line(line_obj: Dict[str, Any]) -> Optional[str]:
+    """
+    Extract TaskId correlation ID from the echoed request text in a Vertex batch output line.
+    We embed a line like: 'TASK_ID: <32-hex>' into the prompt at submit time, then recover it here.
+    """
+    if not isinstance(line_obj, dict):
+        return None
+    req = line_obj.get("request") or {}
+    contents = req.get("contents") or []
+    if not contents:
+        return None
+    parts = (contents[0] or {}).get("parts") or []
+    if not parts:
+        return None
+    text = (parts[0] or {}).get("text") or ""
+    if not isinstance(text, str) or not text:
+        return None
+    m = re.search(r"\bTASK_ID:\s*([0-9a-f]{32})\b", text, flags=re.IGNORECASE)
+    if not m:
+        return None
+    return m.group(1).lower()
+
+
 def _gcs_upload_jsonl(bucket_name: str, blob_path: str, lines: List[str], project_id: str) -> None:
     """Upload JSONL lines to GCS (requires google-cloud-storage)."""
     if gcs_storage is None:
@@ -1163,7 +1187,10 @@ def run_batch_submit(
             top3_agent2=top3_a2 or None,
             disagreement_type=disagreement_type,
         )
-        full_prompt = f"{SYSTEM_PROMPT.strip()}\n\nUSER INPUT:\n{user_prompt}"
+        # Correlation ID: embed TaskId into the request text so batch outputs can be mapped
+        # deterministically without relying on output row order.
+        user_prompt_with_id = f"TASK_ID: {task['TaskId']}\n{user_prompt}"
+        full_prompt = f"{SYSTEM_PROMPT.strip()}\n\nUSER INPUT:\n{user_prompt_with_id}"
         line_obj = _vertex_batch_request_line(full_prompt)
         lines.append(json.dumps(line_obj))
         conflict_tasks.append({"task_id": task["TaskId"], "resolution_mode": resolution_mode})
@@ -1289,10 +1316,16 @@ def run_batch_collect(
 
     saved = 0
     errors = 0
+    expected_ids = set(str(x).strip().lower() for x in (task_ids or []) if str(x).strip())
     for i, line_obj in enumerate(output_lines):
-        task_id = task_ids[i] if i < len(task_ids) else None
+        task_id = _extract_task_id_from_vertex_batch_line(line_obj)
         if not task_id:
             errors += 1
+            print(f"  row {i}: missing TASK_ID in echoed request; cannot map result to task")
+            continue
+        if expected_ids and task_id.lower() not in expected_ids:
+            errors += 1
+            print(f"  {task_id}: TASK_ID not in expected task_ids list; skipping row")
             continue
         if line_obj.get("status"):
             mark_judge_error(con, task_id, batch_id=batch_id_short)
