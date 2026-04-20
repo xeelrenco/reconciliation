@@ -71,7 +71,7 @@ def _cfg(key: str, default: Optional[str] = None) -> str:
     return get_config().get(key, default or "").strip()
 
 
-DEFAULT_MODEL = _cfg("LLM_MODEL", "gpt-5-mini")
+DEFAULT_MODEL = "gpt-5"
 RECOVERY_AGENT_NAME = "recovery_gpt"
 
 DB_SCHEMA = "my_db.mdr_reconciliation"
@@ -422,18 +422,59 @@ Important:
 - If you choose MATCH, the selected candidate must be one of the candidate IDs in the AGENT POOL.
 - If you choose NO_MATCH, selected_candidate_id must be null.
 
-Decision policy (strict):
-- Prefer MATCH when one candidate is the best available semantic fit, even if not perfect.
-- Use NO_MATCH only when no candidate is credibly compatible with the MDR title intent.
-- Do not reject a candidate only because it is broader/narrower if it still preserves the main document intent.
-- If the ideal title is missing from the pool, select the closest available candidate and explain the limitation.
+Decision policy (strongly bias toward MATCH when a credible candidate exists):
+- Prefer MATCH whenever any candidate in the pool preserves the MDR title's core subject / functional asset, even with secondary mismatches (document sub-type, construction method, narrower or broader scope, discipline tag).
+- Use NO_MATCH only when every candidate fails on the primary subject/asset itself (i.e. the pool simply does not contain a document about the same thing).
+- Do NOT reject a candidate just because:
+  * it is broader or narrower in scope,
+  * it is a specification instead of a drawing / data sheet / report (or vice versa),
+  * it is a "typical" or "standard" version of a site-specific item,
+  * the construction method differs (e.g. cast-in-place RC drawings for a precast facade panel: accept, the structural element is the same concrete building element),
+  * it is a collection/vendor-docs bundle instead of a single document (e.g. vendor docs for package systems for a lifting/commissioning plan: accept, the functional asset is the same),
+  * it is an inspection data sheet or technical specification with test/inspection requirements when the MDR asks for an Inspection & Test Plan (accept as ITP-adjacent),
+  * it is a layout-only document when the MDR asks for a section/detail drawing of the same asset (accept),
+  * it names a slightly different but adjacent system in the same discipline (e.g. telecommunication supply spec for a communication infrastructure document: accept).
 - Prioritize, in order:
-  1) core semantic intent of MDR title,
-  2) document type compatibility (layout/specification/drawing/etc.),
-  3) discipline/metadata consistency.
-- For civil/structural cases, prefer object+document-type alignment over restrictive qualifiers.
-- For layout cases, prefer direct layout-title alignment when available.
-- For electrical/ICT panel cases, prefer equipment form-factor alignment (panel/switchboard/layout) over generic system wording when semantically close.
+  1) core semantic intent / functional asset of the MDR title,
+  2) discipline/chapter coherence,
+  3) document type compatibility (weakest criterion - sub-type mismatches are acceptable).
+- Typical acceptable stretches (these are MATCH, not NO_MATCH):
+  * precast concrete facade panel drawing -> reinforced concrete structures / foundations drawings for buildings,
+  * architectural facade materials specification -> acceptable if no concrete drawing exists,
+  * steel structures ITP -> inspection data sheet for steelwork OR technical supply specification for steelwork (both acceptable),
+  * HVAC ITP -> inspection data sheet for HVAC & plumbing system,
+  * area piping arrangement -> unit plot plan (area-level layout is closer than a pipe-rack single-line),
+  * noise study specification -> plant and equipment noise control technical specification (specification-type match preferred over report).
+
+Tie-breaker rules (apply when two or more candidates look plausible; these overrule document-type similarity):
+
+  T1 - Package / skid preference.
+       When the MDR describes a PROCEDURE, PLAN, STUDY, DOSSIER, CABLE LIST, SPARE PARTS LIST or SIMILAR DERIVED DOCUMENT about a package / skid / major piece of equipment (compressor skid, HRSG, gas turbine unit, seals gas recovery skid, etc.), PREFER the "VENDOR DWGS AND DOCUMENTS FOR <the package>" candidate over:
+         - a vendor-docs bundle of a sub-component of that package,
+         - an inspection data sheet of a sub-component,
+         - a narrow derivative document of a single sub-system.
+       Examples from real cases to imitate:
+         * compressor skid lifting & installation procedure -> VENDOR DWGS AND DOCUMENTS FOR PACKAGE SYSTEMS (preferred over general specs for package systems);
+         * gas turbine UPS commissioning procedure -> VENDOR DWGS AND DOCUMENTS FOR GAS TURBINES (preferred over inspection data sheet for UPS AC system);
+         * HRSG cable list -> VENDOR DWGS AND DOCUMENTS FOR HRSG AND WHRU (preferred over generic cable list for instrumentation);
+         * seals gas recovery skid - compressor pulse study -> VENDOR DWGS AND DOCUMENTS FOR PACKAGE SYSTEMS (preferred over vendor docs for reciprocating compressors).
+
+  T2 - Discipline coherence.
+       When multiple candidates share the same asset/function and one is in the SAME DISCIPLINE as the MDR while another is not, PREFER the discipline-coherent candidate even if it is more generic.
+       Example: MDR is discipline "Process" and asks for a CCCW circulating pumps data sheet -> PROCESS DATA SHEET FOR ROTATING EQUIPMENT (Process discipline, generic) is preferred over TECHNICAL DATA SHEETS FOR CENTRIFUGAL PUMPS FOR PROCESS SERVICE (Mechanical discipline, more specific).
+
+  T3 - Architecture over supply specification for general infrastructure / IT documents.
+       When the MDR describes "general infrastructure", "communication infrastructure", "IT / ICT plan", "system plan" or similar system-level deliverables, PREFER a "*_SYSTEM ARCHITECTURE" / "*_ARCHITECTURE" candidate over a "TECHNICAL SUPPLY SPECIFICATION FOR ...".
+       Example: general communication infrastructure for electrical building -> TELECOMMUNICATION SYSTEM ARCHITECTURE (preferred over TECHNICAL SUPPLY SPECIFICATION FOR TELECOMMUNICATION SYSTEM).
+
+  T4 - Generic calculation/report over design-criteria for combined-scope calculation MDRs.
+       When the MDR is a CALCULATION REPORT / TECHNICAL REPORT combining two systems (e.g. sanitary sewage + rainwater drainage), PREFER a more GENERIC calculation-type candidate that can plausibly cover both systems (e.g. PLUMBING CALCULATION REPORT) over a DESIGN CRITERIA document or a single-system calculation report.
+       Rationale: same document type is worth more than narrow scope alignment in this family.
+
+  T5 - Compressor pulsation study specifically for a skid.
+       Prefer PACKAGE SYSTEMS vendor docs over RECIPROCATING COMPRESSORS vendor docs when the MDR title is anchored on "skid" / "recovery skid" / "skid package" even if the pulsation/compressor content is explicitly named. See T1 for the general form.
+
+- Only confirm NO_MATCH when the pool is truly off-topic (e.g. vendor list vs vendor-docs for a specific equipment item, project schedule vs discipline-specific schedules, monthly progress report vs static technical reports).
 
 Mode-specific meanings:
 - manual_review_resolver:
@@ -516,9 +557,16 @@ def build_user_prompt(
             )
     blocks.append("")
     blocks.append("DECISION REMINDER")
-    blocks.append("- Prefer MATCH on the best available pool candidate when semantically credible.")
-    blocks.append("- Use NO_MATCH only if all pool candidates are not credibly compatible.")
-    blocks.append("- If forced to choose among imperfect options, pick closest available and explain trade-offs.")
+    blocks.append("- Strong bias toward MATCH: select the closest pool candidate whenever it shares the same subject/functional asset with the MDR title.")
+    blocks.append("- Document sub-type mismatches (drawing vs spec vs data sheet vs ITP), construction-method differences (precast vs cast-in-place), scope breadth differences, and collection-vs-single-doc differences are NOT valid reasons for NO_MATCH.")
+    blocks.append("- Use NO_MATCH ONLY if every candidate is off-topic on the primary subject itself (the pool does not contain any document about the same asset/system/activity).")
+    blocks.append("- When stretching, pick the closest available option and explain the trade-off in reasoning_summary; do not default to NO_MATCH to be safe.")
+    blocks.append("- Apply tie-breakers when multiple candidates are plausible:")
+    blocks.append("  T1) For procedures/plans/studies/dossiers/cable-lists/spare-lists attached to a SKID / PACKAGE / MAJOR EQUIPMENT (compressor skid, HRSG, gas turbine, seals gas recovery skid): PREFER 'VENDOR DWGS AND DOCUMENTS FOR <the package>' over vendor docs of a sub-component or an inspection data sheet of a sub-component.")
+    blocks.append("  T2) If the MDR discipline is explicit (e.g. Process), PREFER a candidate in the SAME discipline even if it is more generic, over a candidate in a different discipline that is more specific.")
+    blocks.append("  T3) For 'general infrastructure' / 'IT plan' / 'communication infrastructure' / system-level planning documents: PREFER '*_ARCHITECTURE' candidates over 'TECHNICAL SUPPLY SPECIFICATION FOR *' candidates.")
+    blocks.append("  T4) For CALCULATION REPORTS that combine two systems (e.g. sanitary + rainwater): PREFER a generic calculation/report candidate that covers both (e.g. 'PLUMBING CALCULATION REPORT') over a DESIGN CRITERIA document or a single-system calculation.")
+    blocks.append("  T5) In case of draw between 'VENDOR DWGS FOR PACKAGE SYSTEMS' and 'VENDOR DWGS FOR <sub-component>' when the MDR is anchored on a skid/package: PREFER the PACKAGE SYSTEMS candidate.")
     blocks.append("")
     blocks.append("Return JSON only.")
     return "\n".join(blocks)
