@@ -13,9 +13,12 @@ Modes:
 - both: process both categories
 
 Candidate pool:
-- Uses only the union of GPT/Claude top-3 candidates already saved in
+- Uses the union of GPT/Claude top-3 candidates already saved in
   MdrReconciliationAgentTopCandidates
-- Does not re-run retrieval and does not use full top50 candidates
+- Also merges the top-N retrieval candidates from v_MdrReconciliationAgentInput
+  into the same single-pass pool
+- The model should prefer AGENT_TOP3 candidates by default and use RAG_FALLBACK
+  candidates only when they are clearly better
 
 Config:
 - config.txt (MOTHERDUCK_*, OPENAI_API_KEY, PROMPT_VERSION)
@@ -24,6 +27,9 @@ Usage:
   python 3.4_run_recovery_agent.py --mode manual-review
   python 3.4_run_recovery_agent.py --mode no-match
   python 3.4_run_recovery_agent.py --mode both --limit 50 --workers 4
+  python 3.4_run_recovery_agent.py --mode both --batch --limit 200
+  python 3.4_run_recovery_agent.py --batch-collect
+  python 3.4_run_recovery_agent.py --batch-collect --batch-id <id>
 """
 
 import argparse
@@ -31,6 +37,8 @@ import json
 import queue
 import re
 import threading
+import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -40,6 +48,9 @@ from openai import OpenAI
 
 
 CONFIG_PATH = Path(__file__).resolve().parent / "config.txt"
+BATCH_ID_FILE = Path(__file__).resolve().parent / ".recovery_last_batch_id"
+BATCH_META_FILE = Path(__file__).resolve().parent / ".recovery_last_batch_meta.json"
+BATCH_ENDPOINT = "/v1/responses"
 
 
 def load_config(path: Optional[Path] = None) -> Dict[str, str]:
@@ -88,7 +99,9 @@ JUDGE_AGENT_NAME = "judge_gemini"
 
 STAGE_MANUAL_REVIEW = "manual_review_resolver"
 STAGE_NO_MATCH = "no_match_recovery"
-RECOVERY_CANDIDATE_POOL_TYPE = "agent_top3_union_only"
+DEFAULT_FALLBACK_TOP_N = 10
+RAG_FALLBACK_POOL_PREFIX = "agent_top3_plus_rag_top"
+MDR_AGENT_INPUT_VIEW = "my_db.mdr_reconciliation.v_MdrReconciliationAgentInput"
 
 MODE_TO_SOURCE = {
     "manual-review": "MANUAL_REVIEW",
@@ -153,6 +166,27 @@ def recovery_stage_for_final_decision(final_decision_type: str) -> str:
         return SOURCE_TO_STAGE[str(final_decision_type).strip().upper()]
     except KeyError as e:
         raise ValueError(f"Unsupported final decision type for recovery: {final_decision_type!r}") from e
+
+
+def make_batch_custom_id(task: Dict[str, Any]) -> str:
+    return "||".join(
+        [
+            norm(task.get("TaskId")),
+            norm(task.get("PromptVersion")),
+            norm(task.get("EmbeddingModel")),
+        ]
+    )
+
+
+def parse_batch_custom_id(custom_id: str) -> Dict[str, str]:
+    parts = str(custom_id or "").split("||")
+    if len(parts) != 3 or not all(parts):
+        raise ValueError(f"Invalid batch custom_id: {custom_id!r}")
+    return {
+        "TaskId": parts[0],
+        "PromptVersion": parts[1],
+        "EmbeddingModel": parts[2],
+    }
 
 
 def fetch_tasks(
@@ -225,6 +259,54 @@ def fetch_tasks(
         "ExistingRecoveryStage",
     ]
     return [dict(zip(cols, r)) for r in rows]
+
+
+def fetch_task_by_identity(
+    con: duckdb.DuckDBPyConnection,
+    task_id: str,
+    prompt_version: str,
+    embedding_model: str,
+) -> Optional[Dict[str, Any]]:
+    row = con.execute(
+        f"""
+        SELECT
+          t.TaskId,
+          t.Document_title,
+          t.PromptVersion,
+          t.EmbeddingModel,
+          r.FinalDecisionType,
+          r.FinalTitleKey,
+          r.FinalRaciTitle,
+          r.FinalConfidence,
+          r.ResolutionMode,
+          r.FinalReason
+        FROM {RESULTS_TABLE} r
+        JOIN {TASKS_TABLE} t
+          ON t.TaskId = r.TaskId
+         AND t.PromptVersion = r.PromptVersion
+         AND t.EmbeddingModel = r.EmbeddingModel
+        WHERE t.TaskId = ?
+          AND t.PromptVersion = ?
+          AND t.EmbeddingModel = ?
+        LIMIT 1
+        """,
+        [task_id, prompt_version, embedding_model],
+    ).fetchone()
+    if not row:
+        return None
+    cols = [
+        "TaskId",
+        "Document_title",
+        "PromptVersion",
+        "EmbeddingModel",
+        "FinalDecisionType",
+        "FinalTitleKey",
+        "FinalRaciTitle",
+        "FinalConfidence",
+        "ResolutionMode",
+        "FinalReason",
+    ]
+    return dict(zip(cols, row))
 
 
 def fetch_mdr_context(con: duckdb.DuckDBPyConnection, document_title: str) -> Dict[str, Any]:
@@ -323,6 +405,44 @@ def load_agent_top_candidates(
     return [dict(zip(cols, r)) for r in rows]
 
 
+def load_rag_top_candidates(
+    con: duckdb.DuckDBPyConnection,
+    document_title: str,
+    prompt_version: str,
+    embedding_model: str,
+    top_n: int,
+) -> List[Dict[str, Any]]:
+    rows = con.execute(
+        f"""
+        SELECT
+          Rank,
+          Similarity,
+          TitleKey,
+          RaciTitle,
+          DisciplineName,
+          TypeName,
+          ChapterName
+        FROM {MDR_AGENT_INPUT_VIEW}
+        WHERE Document_title = ?
+          AND PromptVersion = ?
+          AND EmbeddingModel = ?
+          AND Rank <= ?
+        ORDER BY Rank
+        """,
+        [document_title, prompt_version, embedding_model, int(top_n)],
+    ).fetchall()
+    cols = [
+        "Rank",
+        "Similarity",
+        "TitleKey",
+        "RaciTitle",
+        "DisciplineName",
+        "TypeName",
+        "ChapterName",
+    ]
+    return [dict(zip(cols, r)) for r in rows]
+
+
 def build_agent_pool(
     top3_gpt: List[Dict[str, Any]],
     top3_claude: List[Dict[str, Any]],
@@ -361,7 +481,58 @@ def build_agent_pool(
     )
     for idx, item in enumerate(merged, 1):
         item["CandidateId"] = f"C{idx:02d}"
+        item["InAgentTop3"] = True
     return merged
+
+
+def build_expanded_pool(
+    top3_gpt: List[Dict[str, Any]],
+    top3_claude: List[Dict[str, Any]],
+    rag_top_candidates: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    base_pool = build_agent_pool(top3_gpt, top3_claude)
+    seen = {norm(item.get("TitleKey")).lower() for item in base_pool if norm(item.get("TitleKey"))}
+    expanded = []
+    for item in base_pool:
+        cloned = dict(item)
+        cloned["Sources"] = list(item.get("Sources") or [])
+        cloned["InAgentTop3"] = True
+        expanded.append(cloned)
+
+    for item in rag_top_candidates or []:
+        key = norm(item.get("TitleKey"))
+        if not key or key.lower() in seen:
+            continue
+        seen.add(key.lower())
+        expanded.append(
+            {
+                "TitleKey": key,
+                "RaciTitle": norm(item.get("RaciTitle")),
+                "Sources": [
+                    {
+                        "Agent": "RAG_FALLBACK",
+                        "Rank": item.get("Rank"),
+                        "Confidence": item.get("Similarity"),
+                        "WhyPlausible": "",
+                        "DisciplineName": norm(item.get("DisciplineName")),
+                        "TypeName": norm(item.get("TypeName")),
+                        "ChapterName": norm(item.get("ChapterName")),
+                    }
+                ],
+                "InAgentTop3": False,
+            }
+        )
+
+    expanded.sort(
+        key=lambda c: (
+            0 if c.get("InAgentTop3") else 1,
+            min(int(s.get("Rank") or 999) for s in c["Sources"]),
+            c["TitleKey"],
+        )
+    )
+    for idx, item in enumerate(expanded, 1):
+        item["CandidateId"] = f"C{idx:02d}"
+    return expanded
 
 
 RECOVERY_SCHEMA = {
@@ -401,6 +572,40 @@ RECOVERY_SCHEMA = {
 }
 
 
+def _responses_batch_request_body(model: str, user_prompt: str) -> Dict[str, Any]:
+    return {
+        "model": model,
+        "input": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "recovery_agent_evaluation",
+                "schema": RECOVERY_SCHEMA,
+                "strict": True,
+            }
+        },
+    }
+
+
+def _extract_output_text_from_batch_response_body(body: Dict[str, Any]) -> Optional[str]:
+    if not isinstance(body, dict):
+        return None
+    if body.get("output_text"):
+        return body["output_text"]
+    output = body.get("output") or []
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content") or []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "output_text":
+                return block.get("text")
+    return None
+
+
 SYSTEM_PROMPT = """
 You are a recovery agent for MDR-to-RACI reconciliation.
 
@@ -413,7 +618,9 @@ You will receive:
 - the current final outcome from the baseline pipeline
 - GPT and Claude decisions/reasoning
 - GPT and Claude top candidates
-- a merged candidate pool built ONLY from the union of GPT/Claude top candidates
+- a single merged candidate pool that includes:
+  * candidates already present in the GPT/Claude top-3 union, tagged as [AGENT_TOP3]
+  * additional retrieval candidates up to top-N, tagged as [RAG_FALLBACK]
 
 Important:
 - Do NOT invent new candidates.
@@ -421,60 +628,151 @@ Important:
 - You MUST return only MATCH or NO_MATCH.
 - If you choose MATCH, the selected candidate must be one of the candidate IDs in the AGENT POOL.
 - If you choose NO_MATCH, selected_candidate_id must be null.
+- Prefer [AGENT_TOP3] candidates by default.
+- Select a [RAG_FALLBACK] candidate only when it is clearly a better semantic fit than every plausible [AGENT_TOP3] candidate.
 
-Decision policy (strongly bias toward MATCH when a credible candidate exists):
-- Prefer MATCH whenever any candidate in the pool preserves the MDR title's core subject / functional asset, even with secondary mismatches (document sub-type, construction method, narrower or broader scope, discipline tag).
-- Use NO_MATCH only when every candidate fails on the primary subject/asset itself (i.e. the pool simply does not contain a document about the same thing).
-- Do NOT reject a candidate just because:
+Decision process:
+1. Start from the PRIMARY SUBJECT / ASSET / SYSTEM / ACTIVITY named by the MDR title.
+2. If no candidate in the pool is really about that same primary subject, return NO_MATCH.
+3. If one or more candidates preserve that subject, prefer MATCH even with secondary mismatches.
+4. Then apply the strict exceptions below before using tie-breakers.
+
+Core policy:
+- Prefer MATCH whenever a candidate preserves the MDR title's core subject / functional asset, even with secondary mismatches in:
+  * document sub-type,
+  * construction method,
+  * scope breadth,
+  * discipline tag.
+- Use NO_MATCH when every candidate fails on the primary subject/asset itself.
+- By default, rank candidates in this order:
+  1) core semantic intent / functional asset,
+  2) package or system anchor when explicitly named,
+  3) discipline/chapter coherence,
+  4) document type compatibility.
+- Do NOT reject a candidate only because:
   * it is broader or narrower in scope,
   * it is a specification instead of a drawing / data sheet / report (or vice versa),
   * it is a "typical" or "standard" version of a site-specific item,
-  * the construction method differs (e.g. cast-in-place RC drawings for a precast facade panel: accept, the structural element is the same concrete building element),
-  * it is a collection/vendor-docs bundle instead of a single document (e.g. vendor docs for package systems for a lifting/commissioning plan: accept, the functional asset is the same),
-  * it is an inspection data sheet or technical specification with test/inspection requirements when the MDR asks for an Inspection & Test Plan (accept as ITP-adjacent),
-  * it is a layout-only document when the MDR asks for a section/detail drawing of the same asset (accept),
-  * it names a slightly different but adjacent system in the same discipline (e.g. telecommunication supply spec for a communication infrastructure document: accept).
-- Prioritize, in order:
-  1) core semantic intent / functional asset of the MDR title,
-  2) discipline/chapter coherence,
-  3) document type compatibility (weakest criterion - sub-type mismatches are acceptable).
-- Typical acceptable stretches (these are MATCH, not NO_MATCH):
-  * precast concrete facade panel drawing -> reinforced concrete structures / foundations drawings for buildings,
-  * architectural facade materials specification -> acceptable if no concrete drawing exists,
-  * steel structures ITP -> inspection data sheet for steelwork OR technical supply specification for steelwork (both acceptable),
-  * HVAC ITP -> inspection data sheet for HVAC & plumbing system,
-  * area piping arrangement -> unit plot plan (area-level layout is closer than a pipe-rack single-line),
-  * noise study specification -> plant and equipment noise control technical specification (specification-type match preferred over report).
+  * it is a collection/vendor-docs bundle instead of a single document,
+  * the construction method differs.
 
-Tie-breaker rules (apply when two or more candidates look plausible; these overrule document-type similarity):
+Strict exceptions (these override the general bias toward MATCH):
 
-  T1 - Package / skid preference.
-       When the MDR describes a PROCEDURE, PLAN, STUDY, DOSSIER, CABLE LIST, SPARE PARTS LIST or SIMILAR DERIVED DOCUMENT about a package / skid / major piece of equipment (compressor skid, HRSG, gas turbine unit, seals gas recovery skid, etc.), PREFER the "VENDOR DWGS AND DOCUMENTS FOR <the package>" candidate over:
-         - a vendor-docs bundle of a sub-component of that package,
-         - an inspection data sheet of a sub-component,
-         - a narrow derivative document of a single sub-system.
-       Examples from real cases to imitate:
-         * compressor skid lifting & installation procedure -> VENDOR DWGS AND DOCUMENTS FOR PACKAGE SYSTEMS (preferred over general specs for package systems);
-         * gas turbine UPS commissioning procedure -> VENDOR DWGS AND DOCUMENTS FOR GAS TURBINES (preferred over inspection data sheet for UPS AC system);
-         * HRSG cable list -> VENDOR DWGS AND DOCUMENTS FOR HRSG AND WHRU (preferred over generic cable list for instrumentation);
-         * seals gas recovery skid - compressor pulse study -> VENDOR DWGS AND DOCUMENTS FOR PACKAGE SYSTEMS (preferred over vendor docs for reciprocating compressors).
+A) Documentary-function strictness.
+- Some titles are primarily about the DOCUMENTARY FUNCTION itself, not just the asset.
+- Strong documentary families include:
+  * register / certificates / certificate / certified record,
+  * vendor list / document list / register / index / schedule / progress report / monthly report / plan,
+  * dossier / data book / quality book / final book / vendor book / turnover book,
+  * material certificates / EN10204 3.1 / inspection certificates / compliance certificates.
+- For these families:
+  * preserve BOTH the asset AND the documentary role whenever possible,
+  * do NOT degrade too easily to generic data sheets, specs, drawings, architecture documents, or equipment lists,
+  * if the pool contains only same-asset technical content but not the documentary function, be much more willing to return NO_MATCH.
+- Important carve-outs:
+  * ITP exception: an Inspection & Test Plan may still MATCH to an inspection data sheet or to a specification/procedure with explicit inspection and acceptance content when the same asset/system is preserved.
+  * QDB / dossier exception: a Quality Data Book / dossier / turnover compilation may still MATCH to a vendor-documents bundle or other compiled documentation package when both the asset and the bundle/compilation nature are preserved.
+  * IT / ICT plan exception: for system-level IT / ICT / communication planning documents, an architecture document remains an acceptable proxy only when it clearly represents the same system-level blueprint/structure.
 
-  T2 - Discipline coherence.
-       When multiple candidates share the same asset/function and one is in the SAME DISCIPLINE as the MDR while another is not, PREFER the discipline-coherent candidate even if it is more generic.
-       Example: MDR is discipline "Process" and asks for a CCCW circulating pumps data sheet -> PROCESS DATA SHEET FOR ROTATING EQUIPMENT (Process discipline, generic) is preferred over TECHNICAL DATA SHEETS FOR CENTRIFUGAL PUMPS FOR PROCESS SERVICE (Mechanical discipline, more specific).
+B) Execution-document strictness.
+- Be stricter for execution-grade families where the missing function materially changes the deliverable.
+- This includes:
+  * field test report / inspection report / test report / proof-test record / test execution record,
+  * method statement / execution methodology / commissioning procedure / operating procedure / energization procedure.
+- For these families:
+  * do NOT degrade too easily to inspection data sheets/checklists, generic specifications, manuals, or as-builts,
+  * preserve BOTH the asset AND the execution/report/procedure function,
+  * do NOT extend the ITP exception automatically to field test reports, completed inspection reports, or method statements.
 
-  T3 - Architecture over supply specification for general infrastructure / IT documents.
-       When the MDR describes "general infrastructure", "communication infrastructure", "IT / ICT plan", "system plan" or similar system-level deliverables, PREFER a "*_SYSTEM ARCHITECTURE" / "*_ARCHITECTURE" candidate over a "TECHNICAL SUPPLY SPECIFICATION FOR ...".
-       Example: general communication infrastructure for electrical building -> TELECOMMUNICATION SYSTEM ARCHITECTURE (preferred over TECHNICAL SUPPLY SPECIFICATION FOR TELECOMMUNICATION SYSTEM).
+C) Drawing-role preservation.
+- When the MDR explicitly asks for a drawing-family deliverable such as layout, general layout, arrangement, overview, routing, wiring diagram, section, detail, elevation, supporting-structure drawing, or area/general-arrangement piping drawing, preserve that functional drawing role more strictly.
+- Prefer candidates that preserve BOTH the asset AND the requested drawing role.
+- Be especially cautious with:
+  * hook-up drawings,
+  * rack-only single lines,
+  * equipment data sheets,
+  * manuals,
+  * generic equipment layouts,
+  * non-graphical documents.
+- Building-specific and system-level layouts/diagrams should keep both the system/building context and the layout/diagram family whenever possible.
+- A layout-only proxy can still be acceptable when it clearly preserves the same asset and drawing family better than all alternatives.
+- But when the MDR explicitly asks for sections, do NOT degrade too easily to layouts/arrangements/plans unless the pool clearly lacks any closer graphical section/elevation/detail family and the asset match is otherwise very strong.
+- Likewise, when the MDR explicitly asks for an asset-specific drawing/detail/layout, do NOT degrade too easily to as-built sets, vendor-document bundles, or manuals unless the title itself is already an as-built/vendor-document/manual family.
+- For area/general-arrangement layouts, be cautious with interface-only or partial-scope proxies:
+  * tie-ins layouts are usually narrower than a full area arrangement,
+  * rack-only single lines are usually narrower than a full piping layout,
+  * area layouts may be weaker than building-specific layouts when the building anchor is explicit.
+- When the MDR explicitly asks for an area piping arrangement/layout/general arrangement, do NOT treat tie-ins layouts or rack-only single lines as acceptable proxies unless the title itself is explicitly limited to tie-ins or to a rack-only scope.
 
-  T4 - Generic calculation/report over design-criteria for combined-scope calculation MDRs.
-       When the MDR is a CALCULATION REPORT / TECHNICAL REPORT combining two systems (e.g. sanitary sewage + rainwater drainage), PREFER a more GENERIC calculation-type candidate that can plausibly cover both systems (e.g. PLUMBING CALCULATION REPORT) over a DESIGN CRITERIA document or a single-system calculation report.
-       Rationale: same document type is worth more than narrow scope alignment in this family.
+D) Revision / update strictness.
+- When the MDR title is about a revision / update / modification of an existing controlled document, preserve that specific revision-controlled document family and scope.
+- Do NOT force MATCH to a merely related neighboring specification unless it credibly preserves the same base-document identity and revision scope.
 
-  T5 - Compressor pulsation study specifically for a skid.
-       Prefer PACKAGE SYSTEMS vendor docs over RECIPROCATING COMPRESSORS vendor docs when the MDR title is anchored on "skid" / "recovery skid" / "skid package" even if the pulsation/compressor content is explicitly named. See T1 for the general form.
+E) Generic-umbrella caution.
+- Do NOT force MATCH when the candidate only preserves a broad engineering class but loses the requested working role or deliverable scope.
+- Typical weak umbrella substitutions:
+  * buffer/accumulator tank for actuated valves -> generic pressure vessels data sheet,
+  * full power supply & distribution calculations -> simple load summary,
+  * equipment-specific reliability report -> plant-level RAM report,
+  * system/database setup -> coding-system design criteria,
+  * combined support data sheet (spring + PTFE/Teflon) -> generic supports system spec,
+  * control philosophy -> procurement/supply specification,
+  * study specification / terms of reference -> completed study report,
+  * equipment/package study -> generic vendor-docs bundle.
+- Also be cautious with scope-loss substitutions such as:
+  * general communication / infrastructure / system-level deliverable -> narrow telecom procurement specification,
+  * general communication / infrastructure / system-level deliverable -> structured-cabling / LAN bid evaluation or similarly narrow subsystem procurement document,
+  * full calculation package -> subsystem-only study or summary,
+  * project-wide or temporary-works system document -> permanent building/subsystem artifact,
+  * general study/specification title -> very narrow subsystem study in another discipline just because it shares the word "study",
+  * umbrella multi-study specification / ToR -> single-study ToR unless the title itself clearly centers that one study.
 
-- Only confirm NO_MATCH when the pool is truly off-topic (e.g. vendor list vs vendor-docs for a specific equipment item, project schedule vs discipline-specific schedules, monthly progress report vs static technical reports).
+Tie-breakers (use only after the rules above):
+
+T1 - Package anchor dominance.
+     When the MDR explicitly names a package / skid / unit / train / major equipment family, treat that anchor as a primary semantic constraint.
+     Prefer a package-level vendor-docs/manuals bundle tied to that same named package over:
+       - a sub-component vendor-docs bundle,
+       - an inspection data sheet of a sub-component,
+       - a generic same-discipline document that loses the named package.
+     But this package-anchor preference does NOT override execution-document strictness: for lifting / installation / commissioning procedures or plans, do not accept vendor-doc bundles or manuals when they materially lose the requested procedure/plan role.
+     Examples:
+      * compressor skid vendor documentation set -> VENDOR DWGS AND DOCUMENTS FOR PACKAGE SYSTEMS,
+       * gas turbine UPS commissioning procedure -> VENDOR DWGS AND DOCUMENTS FOR GAS TURBINES,
+       * HRSG cable list -> VENDOR DWGS AND DOCUMENTS FOR HRSG AND WHRU,
+       * seals gas recovery skid compressor study -> PACKAGE SYSTEMS vendor docs over reciprocating-compressor docs.
+
+T2 - Discipline coherence.
+     When two candidates preserve the same core asset and one is in the SAME discipline as the MDR while another is not, prefer the discipline-coherent candidate even if it is more generic.
+     Example: Process pumps data sheet -> PROCESS DATA SHEET FOR ROTATING EQUIPMENT over a more specific Mechanical pump sheet.
+
+T3 - System-level architecture over procurement spec.
+     For general infrastructure / communication infrastructure / IT-ICT system-level planning titles, prefer an architecture document over a technical supply specification when both are plausible.
+
+T4 - Combined-scope calculation reports.
+     When the MDR is a CALCULATION REPORT / TECHNICAL REPORT combining two systems, prefer a generic calculation/report candidate that can plausibly cover both systems over:
+       - a design criteria document,
+       - a single-system calculation report.
+     Example: sanitary sewage + rainwater drainage -> PLUMBING CALCULATION REPORT.
+     But do NOT degrade a clearly broad calculation package to a simple load summary or to a calculation that covers only one narrow subsystem unless nothing broader exists at all.
+
+T5 - Micro-domain cautions.
+     Apply these only when directly relevant:
+       - canopy / shelter / enclosure are NOT interchangeable unless the functional asset and structural role are genuinely aligned,
+       - near-duplicate façade precast panel titles should be treated consistently when the available pool quality is materially the same,
+       - for façade precast panel drawings, if the pool lacks any genuine façade / precast / architectural-panel drawing, generic reinforced-concrete building/foundation drawings are usually too weak and NO_MATCH is generally preferred,
+       - apply that façade-panel policy consistently across sibling façade panel titles under materially equivalent pools,
+       - a noise study specification can acceptably map to a noise-control technical specification,
+       - a general communication/system-infrastructure title should not collapse too quickly to a narrow telecom supply spec or to a structured-cabling/LAN bid-evaluation style document when the broader system scope is materially lost,
+       - control philosophy should prefer philosophy / narratives / architecture style documents over supply specifications when both are plausible,
+       - study specifications / terms of reference should prefer specification-like documents over completed reports when both are plausible,
+       - for study/specification titles, do not prefer a much narrower or cross-discipline study merely because it preserves the word "study" if it materially loses the main subject scope,
+       - for umbrella study/specification titles, do not narrow to a single-study ToR/report unless the MDR clearly signals that one study as the dominant scope,
+       - for spare-parts / commissioning-start-up list titles, preserve the spare-parts list role and lifecycle phase; generic equipment lists, vendor-doc bundles, or neighboring-discipline spare-parts lists are usually too weak,
+       - for lifting / installation procedure-plan titles, preserve the site-execution procedure/plan role; manuals or generic installation documents are usually too weak even when the equipment family is related,
+       - when the MDR title explicitly names two co-equal assets/components in the same deliverable, do not degrade to a candidate that clearly covers only one of them unless the other is plainly accessory or implied by the same document family.
+
+Only confirm NO_MATCH when the pool lacks a credible candidate after applying the strict exceptions and tie-breakers above.
 
 Mode-specific meanings:
 - manual_review_resolver:
@@ -501,6 +799,7 @@ def build_user_prompt(
     claude_decision: Optional[Dict[str, Any]],
     judge_decision: Optional[Dict[str, Any]],
     pool: List[Dict[str, Any]],
+    fallback_top_n: int = DEFAULT_FALLBACK_TOP_N,
 ) -> str:
     blocks: List[str] = []
 
@@ -547,26 +846,36 @@ def build_user_prompt(
         blocks.append("<empty>")
     for item in pool:
         blocks.append("----")
-        blocks.append(f"[{item['CandidateId']}]")
+        origin_tag = "[AGENT_TOP3]" if item.get("InAgentTop3", True) else "[RAG_FALLBACK]"
+        blocks.append(f"[{item['CandidateId']}] {origin_tag}")
         blocks.append(f"TitleKey: {norm(item.get('TitleKey'))}")
         blocks.append(f"RaciTitle: {norm(item.get('RaciTitle'))}")
         for src in item.get("Sources") or []:
+            extra = ""
+            if src.get("DisciplineName") or src.get("TypeName") or src.get("ChapterName"):
+                extra = (
+                    f" Discipline={norm(src.get('DisciplineName'))}"
+                    f" Type={norm(src.get('TypeName'))}"
+                    f" Chapter={norm(src.get('ChapterName'))}"
+                )
             blocks.append(
                 f"Source={src.get('Agent')} Rank={src.get('Rank')} "
-                f"Confidence={src.get('Confidence')} Why={norm(src.get('WhyPlausible'))}"
+                f"Confidence={src.get('Confidence')} Why={norm(src.get('WhyPlausible'))}{extra}"
             )
     blocks.append("")
     blocks.append("DECISION REMINDER")
-    blocks.append("- Strong bias toward MATCH: select the closest pool candidate whenever it shares the same subject/functional asset with the MDR title.")
-    blocks.append("- Document sub-type mismatches (drawing vs spec vs data sheet vs ITP), construction-method differences (precast vs cast-in-place), scope breadth differences, and collection-vs-single-doc differences are NOT valid reasons for NO_MATCH.")
-    blocks.append("- Use NO_MATCH ONLY if every candidate is off-topic on the primary subject itself (the pool does not contain any document about the same asset/system/activity).")
-    blocks.append("- When stretching, pick the closest available option and explain the trade-off in reasoning_summary; do not default to NO_MATCH to be safe.")
-    blocks.append("- Apply tie-breakers when multiple candidates are plausible:")
-    blocks.append("  T1) For procedures/plans/studies/dossiers/cable-lists/spare-lists attached to a SKID / PACKAGE / MAJOR EQUIPMENT (compressor skid, HRSG, gas turbine, seals gas recovery skid): PREFER 'VENDOR DWGS AND DOCUMENTS FOR <the package>' over vendor docs of a sub-component or an inspection data sheet of a sub-component.")
-    blocks.append("  T2) If the MDR discipline is explicit (e.g. Process), PREFER a candidate in the SAME discipline even if it is more generic, over a candidate in a different discipline that is more specific.")
-    blocks.append("  T3) For 'general infrastructure' / 'IT plan' / 'communication infrastructure' / system-level planning documents: PREFER '*_ARCHITECTURE' candidates over 'TECHNICAL SUPPLY SPECIFICATION FOR *' candidates.")
-    blocks.append("  T4) For CALCULATION REPORTS that combine two systems (e.g. sanitary + rainwater): PREFER a generic calculation/report candidate that covers both (e.g. 'PLUMBING CALCULATION REPORT') over a DESIGN CRITERIA document or a single-system calculation.")
-    blocks.append("  T5) In case of draw between 'VENDOR DWGS FOR PACKAGE SYSTEMS' and 'VENDOR DWGS FOR <sub-component>' when the MDR is anchored on a skid/package: PREFER the PACKAGE SYSTEMS candidate.")
+    blocks.append("- First decide whether any candidate truly preserves the MDR's main asset/system/activity. If not, return NO_MATCH.")
+    blocks.append("- Keep a strong bias toward MATCH only after a same-subject candidate exists; then accept secondary mismatches in subtype, scope, or construction method.")
+    blocks.append("- Before stretching, check whether the title belongs to a strict family: documentary-function, execution-grade, revision/update, drawing-role, broad system/package scope, or a role-sensitive study/philosophy/specification title. Those families require closer preservation of the requested function and scope.")
+    blocks.append("- If the title explicitly names a package/skid/unit, prefer candidates that preserve that same package anchor over generic same-discipline documents.")
+    blocks.append("- Be cautious with narrow proxies for broad asks: telecom/structured-cabling procurement docs for general infrastructure, load summaries for full calculation packages, and tie-ins/rack-only drawings for full area arrangements are often too weak.")
+    blocks.append("- Be cautious with role drift: control philosophy -> supply spec, study specification -> report, single-study ToR for an umbrella study spec, asset-specific drawings -> as-built bundles, section drawings -> layouts, and façade panel titles with equivalent pools should usually be decided consistently.")
+    blocks.append("- If the title explicitly contains two co-equal assets/components, prefer candidates that plausibly cover both; a single-asset candidate is usually too weak unless the other item is clearly accessory.")
+    blocks.append("- For study/specification titles, do not prefer a much narrower or cross-discipline study only because it contains the word 'study'.")
+    blocks.append("- For façade precast panel drawings without any true façade/precast proxy in pool, generic RC building/foundation drawings are usually too weak, so prefer NO_MATCH.")
+    blocks.append("- For spare-parts lists and lifting/installation procedure-plans, preserve that operational role directly; generic manuals, vendor bundles, or generic lists are usually too weak.")
+    blocks.append("- Prefer AGENT_TOP3 candidates by default; use a RAG_FALLBACK candidate only when it is clearly better on the same subject.")
+    blocks.append("- Use tie-breakers only after the rules above, and explain the chosen trade-off briefly in reasoning_summary.")
     blocks.append("")
     blocks.append("Return JSON only.")
     return "\n".join(blocks)
@@ -581,6 +890,7 @@ def call_recovery_agent(
     claude_decision: Optional[Dict[str, Any]],
     judge_decision: Optional[Dict[str, Any]],
     pool: List[Dict[str, Any]],
+    fallback_top_n: int = DEFAULT_FALLBACK_TOP_N,
 ) -> Dict[str, Any]:
     user_prompt = build_user_prompt(
         stage=stage,
@@ -590,6 +900,7 @@ def call_recovery_agent(
         claude_decision=claude_decision,
         judge_decision=judge_decision,
         pool=pool,
+        fallback_top_n=fallback_top_n,
     )
     resp = client.responses.create(
         model=model,
@@ -693,6 +1004,52 @@ def validate_recovery_output(
     }
 
 
+def build_empty_pool_recovery_result(stage: str) -> Dict[str, Any]:
+    return {
+        "RecoveryDecisionType": "NO_MATCH",
+        "RecoveryTitleKey": None,
+        "RecoveryRaciTitle": None,
+        "RecoveryConfidence": 0.0,
+        "RecoveryReason": "No candidate available in the merged recovery pool.",
+        "RecoveryMode": (
+            "manual_review_forced_no_match"
+            if stage == STAGE_MANUAL_REVIEW
+            else "no_match_confirmed"
+        ),
+    }
+
+
+def prepare_recovery_inputs(
+    con: duckdb.DuckDBPyConnection,
+    task: Dict[str, Any],
+    fallback_top_n: int,
+) -> Dict[str, Any]:
+    stage = recovery_stage_for_final_decision(task["FinalDecisionType"])
+    mdr_ctx = fetch_mdr_context(con, task["Document_title"])
+    gpt_decision = load_agent_decision(con, task["TaskId"], AGENT1_NAME)
+    claude_decision = load_agent_decision(con, task["TaskId"], AGENT2_NAME)
+    judge_decision = load_agent_decision(con, task["TaskId"], JUDGE_AGENT_NAME)
+    top3_gpt = load_agent_top_candidates(con, task["TaskId"], AGENT1_NAME)
+    top3_claude = load_agent_top_candidates(con, task["TaskId"], AGENT2_NAME)
+    rag_top_candidates = load_rag_top_candidates(
+        con=con,
+        document_title=task["Document_title"],
+        prompt_version=task["PromptVersion"],
+        embedding_model=task["EmbeddingModel"],
+        top_n=fallback_top_n,
+    )
+    pool = build_expanded_pool(top3_gpt, top3_claude, rag_top_candidates)
+    return {
+        "stage": stage,
+        "mdr_ctx": mdr_ctx,
+        "gpt_decision": gpt_decision,
+        "claude_decision": claude_decision,
+        "judge_decision": judge_decision,
+        "pool": pool,
+        "candidate_pool_type": f"{RAG_FALLBACK_POOL_PREFIX}{fallback_top_n}",
+    }
+
+
 def save_recovery_result(
     con: duckdb.DuckDBPyConnection,
     task: Dict[str, Any],
@@ -701,93 +1058,93 @@ def save_recovery_result(
     candidate_pool_type: str,
     candidate_pool_size: int,
     result: Dict[str, Any],
+    manage_transaction: bool = True,
 ) -> None:
     ts = now_ts_naive_utc()
-    con.execute(
-        f"""
-        INSERT INTO {RECOVERY_RESULTS_TABLE}
-          (TaskId, Document_title, PromptVersion, EmbeddingModel,
-           SourceFinalDecisionType, RecoveryStage, RecoveryAgentName, RecoveryModel,
-           RecoveryDecisionType, RecoveryTitleKey, RecoveryRaciTitle,
-           RecoveryConfidence, RecoveryReason, RecoveryMode,
-           CandidatePoolType, CandidatePoolSize, CreatedAt, UpdatedAt)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT (TaskId, PromptVersion, EmbeddingModel, RecoveryStage) DO UPDATE SET
-          Document_title = excluded.Document_title,
-          SourceFinalDecisionType = excluded.SourceFinalDecisionType,
-          RecoveryAgentName = excluded.RecoveryAgentName,
-          RecoveryModel = excluded.RecoveryModel,
-          RecoveryDecisionType = excluded.RecoveryDecisionType,
-          RecoveryTitleKey = excluded.RecoveryTitleKey,
-          RecoveryRaciTitle = excluded.RecoveryRaciTitle,
-          RecoveryConfidence = excluded.RecoveryConfidence,
-          RecoveryReason = excluded.RecoveryReason,
-          RecoveryMode = excluded.RecoveryMode,
-          CandidatePoolType = excluded.CandidatePoolType,
-          CandidatePoolSize = excluded.CandidatePoolSize,
-          UpdatedAt = excluded.UpdatedAt
-        """,
-        [
-            task["TaskId"],
-            task["Document_title"],
-            task["PromptVersion"],
-            task["EmbeddingModel"],
-            task["FinalDecisionType"],
-            stage,
-            RECOVERY_AGENT_NAME,
-            model,
-            result["RecoveryDecisionType"],
-            result["RecoveryTitleKey"],
-            result["RecoveryRaciTitle"],
-            result["RecoveryConfidence"],
-            result["RecoveryReason"],
-            result["RecoveryMode"],
-            candidate_pool_type,
-            candidate_pool_size,
-            ts,
-            ts,
-        ],
-    )
+    if manage_transaction:
+        con.execute("BEGIN;")
+    try:
+        con.execute(
+            f"""
+            INSERT INTO {RECOVERY_RESULTS_TABLE}
+              (TaskId, Document_title, PromptVersion, EmbeddingModel,
+               SourceFinalDecisionType, RecoveryStage, RecoveryAgentName, RecoveryModel,
+               RecoveryDecisionType, RecoveryTitleKey, RecoveryRaciTitle,
+               RecoveryConfidence, RecoveryReason, RecoveryMode,
+               CandidatePoolType, CandidatePoolSize, CreatedAt, UpdatedAt)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (TaskId, PromptVersion, EmbeddingModel, RecoveryStage) DO UPDATE SET
+              Document_title = excluded.Document_title,
+              SourceFinalDecisionType = excluded.SourceFinalDecisionType,
+              RecoveryAgentName = excluded.RecoveryAgentName,
+              RecoveryModel = excluded.RecoveryModel,
+              RecoveryDecisionType = excluded.RecoveryDecisionType,
+              RecoveryTitleKey = excluded.RecoveryTitleKey,
+              RecoveryRaciTitle = excluded.RecoveryRaciTitle,
+              RecoveryConfidence = excluded.RecoveryConfidence,
+              RecoveryReason = excluded.RecoveryReason,
+              RecoveryMode = excluded.RecoveryMode,
+              CandidatePoolType = excluded.CandidatePoolType,
+              CandidatePoolSize = excluded.CandidatePoolSize,
+              UpdatedAt = excluded.UpdatedAt
+            """,
+            [
+                task["TaskId"],
+                task["Document_title"],
+                task["PromptVersion"],
+                task["EmbeddingModel"],
+                task["FinalDecisionType"],
+                stage,
+                RECOVERY_AGENT_NAME,
+                model,
+                result["RecoveryDecisionType"],
+                result["RecoveryTitleKey"],
+                result["RecoveryRaciTitle"],
+                result["RecoveryConfidence"],
+                result["RecoveryReason"],
+                result["RecoveryMode"],
+                candidate_pool_type,
+                candidate_pool_size,
+                ts,
+                ts,
+            ],
+        )
+        if manage_transaction:
+            con.execute("COMMIT;")
+    except Exception:
+        if manage_transaction:
+            con.execute("ROLLBACK;")
+        raise
 
 
 def process_one_task(
     con: duckdb.DuckDBPyConnection,
     task: Dict[str, Any],
     model: str,
+    fallback_top_n: int,
 ) -> Optional[Dict[str, Any]]:
-    stage = recovery_stage_for_final_decision(task["FinalDecisionType"])
-
-    mdr_ctx = fetch_mdr_context(con, task["Document_title"])
-    gpt_decision = load_agent_decision(con, task["TaskId"], AGENT1_NAME)
-    claude_decision = load_agent_decision(con, task["TaskId"], AGENT2_NAME)
-    judge_decision = load_agent_decision(con, task["TaskId"], JUDGE_AGENT_NAME)
-
-    top3_gpt = load_agent_top_candidates(con, task["TaskId"], AGENT1_NAME)
-    top3_claude = load_agent_top_candidates(con, task["TaskId"], AGENT2_NAME)
-    pool = build_agent_pool(top3_gpt, top3_claude)
+    prepared = prepare_recovery_inputs(con, task, fallback_top_n)
+    stage = prepared["stage"]
+    mdr_ctx = prepared["mdr_ctx"]
+    gpt_decision = prepared["gpt_decision"]
+    claude_decision = prepared["claude_decision"]
+    judge_decision = prepared["judge_decision"]
+    pool = prepared["pool"]
+    candidate_pool_type = prepared["candidate_pool_type"]
 
     if not pool:
-        result = {
-            "RecoveryDecisionType": "NO_MATCH",
-            "RecoveryTitleKey": None,
-            "RecoveryRaciTitle": None,
-            "RecoveryConfidence": 0.0,
-            "RecoveryReason": "No candidate available in the saved agent pool.",
-            "RecoveryMode": (
-                "manual_review_forced_no_match"
-                if stage == STAGE_MANUAL_REVIEW
-                else "no_match_confirmed"
-            ),
-        }
+        result = build_empty_pool_recovery_result(stage)
         save_recovery_result(
             con=con,
             task=task,
             stage=stage,
             model=model,
-            candidate_pool_type=RECOVERY_CANDIDATE_POOL_TYPE,
+            candidate_pool_type=candidate_pool_type,
             candidate_pool_size=0,
             result=result,
         )
+        result["UsedCandidatePoolType"] = candidate_pool_type
+        result["UsedCandidatePoolSize"] = 0
         return result
 
     raw_result = call_recovery_agent(
@@ -799,18 +1156,277 @@ def process_one_task(
         claude_decision=claude_decision,
         judge_decision=judge_decision,
         pool=pool,
+        fallback_top_n=fallback_top_n,
     )
     validated = validate_recovery_output(stage=stage, result=raw_result, pool=pool)
+    candidate_pool_size = len(pool)
+
     save_recovery_result(
         con=con,
         task=task,
         stage=stage,
         model=model,
-        candidate_pool_type=RECOVERY_CANDIDATE_POOL_TYPE,
-        candidate_pool_size=len(pool),
+        candidate_pool_type=candidate_pool_type,
+        candidate_pool_size=candidate_pool_size,
         result=validated,
     )
+    validated["UsedCandidatePoolType"] = candidate_pool_type
+    validated["UsedCandidatePoolSize"] = candidate_pool_size
     return validated
+
+
+def write_batch_meta(meta: Dict[str, Any]) -> None:
+    BATCH_ID_FILE.write_text(str(meta["batch_id"]), encoding="utf-8")
+    BATCH_META_FILE.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+
+def load_batch_meta(batch_id: str) -> Optional[Dict[str, Any]]:
+    if not BATCH_META_FILE.exists():
+        return None
+    try:
+        meta = json.loads(BATCH_META_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if str(meta.get("batch_id") or "").strip() != str(batch_id).strip():
+        return None
+    return meta
+
+
+def run_batch_submit(
+    con: duckdb.DuckDBPyConnection,
+    tasks: List[Dict[str, Any]],
+    model: str,
+    fallback_top_n: int,
+    mode: str,
+    prompt_version: str,
+    embedding_model: Optional[str],
+    rerun_existing: bool,
+) -> Dict[str, Any]:
+    lines: List[str] = []
+    submitted_custom_ids: List[str] = []
+    saved_without_batch = 0
+
+    for task in tasks:
+        prepared = prepare_recovery_inputs(con, task, fallback_top_n)
+        stage = prepared["stage"]
+        pool = prepared["pool"]
+        candidate_pool_type = prepared["candidate_pool_type"]
+
+        if not pool:
+            result = build_empty_pool_recovery_result(stage)
+            save_recovery_result(
+                con=con,
+                task=task,
+                stage=stage,
+                model=model,
+                candidate_pool_type=candidate_pool_type,
+                candidate_pool_size=0,
+                result=result,
+            )
+            saved_without_batch += 1
+            continue
+
+        user_prompt = build_user_prompt(
+            stage=stage,
+            task=task,
+            mdr_ctx=prepared["mdr_ctx"],
+            gpt_decision=prepared["gpt_decision"],
+            claude_decision=prepared["claude_decision"],
+            judge_decision=prepared["judge_decision"],
+            pool=pool,
+            fallback_top_n=fallback_top_n,
+        )
+        body = _responses_batch_request_body(model, user_prompt)
+        custom_id = make_batch_custom_id(task)
+        lines.append(
+            json.dumps(
+                {
+                    "custom_id": custom_id,
+                    "method": "POST",
+                    "url": BATCH_ENDPOINT,
+                    "body": body,
+                }
+            )
+        )
+        submitted_custom_ids.append(custom_id)
+
+    if not lines:
+        return {
+            "batch_id": None,
+            "submitted_count": 0,
+            "saved_without_batch": saved_without_batch,
+        }
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False, encoding="utf-8") as f:
+        for line in lines:
+            f.write(line + "\n")
+        tmp_path = f.name
+
+    try:
+        with open(tmp_path, "rb") as f:
+            batch_file = client.files.create(file=f, purpose="batch")
+        batch = client.batches.create(
+            input_file_id=batch_file.id,
+            endpoint=BATCH_ENDPOINT,
+            completion_window="24h",
+        )
+        batch_id = batch.id
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+    meta = {
+        "batch_id": batch_id,
+        "model": model,
+        "fallback_top_n": int(fallback_top_n),
+        "mode": mode,
+        "prompt_version": prompt_version,
+        "embedding_model": embedding_model,
+        "rerun_existing": bool(rerun_existing),
+        "submitted_count": len(submitted_custom_ids),
+        "saved_without_batch": saved_without_batch,
+        "submitted_at": now_ts_naive_utc().isoformat(),
+    }
+    write_batch_meta(meta)
+    return {
+        "batch_id": batch_id,
+        "submitted_count": len(submitted_custom_ids),
+        "saved_without_batch": saved_without_batch,
+    }
+
+
+def run_batch_collect(
+    con: duckdb.DuckDBPyConnection,
+    batch_id: str,
+    model: str,
+    fallback_top_n: int,
+    poll_interval: int = 60,
+) -> None:
+    while True:
+        batch = client.batches.retrieve(batch_id)
+        status = getattr(batch, "status", None) or (batch.get("status") if isinstance(batch, dict) else None)
+        if status == "completed":
+            break
+        if status in ("failed", "canceled", "expired"):
+            print(f"Batch {batch_id} ended with status={status}. Cannot collect results.")
+            return
+        print(f"Batch {batch_id} status={status}, waiting {poll_interval}s...")
+        time.sleep(poll_interval)
+
+    saved = 0
+    errors = 0
+    output_file_id = getattr(batch, "output_file_id", None) or (batch.get("output_file_id") if isinstance(batch, dict) else None)
+    error_file_id = getattr(batch, "error_file_id", None) or (batch.get("error_file_id") if isinstance(batch, dict) else None)
+
+    con.execute("BEGIN;")
+    try:
+        if output_file_id:
+            content = client.files.content(output_file_id).content
+            for line in content.decode("utf-8").strip().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    errors += 1
+                    continue
+                custom_id = row.get("custom_id")
+                response = row.get("response") or {}
+                body = response.get("body") if isinstance(response, dict) else {}
+                if not custom_id:
+                    errors += 1
+                    continue
+                try:
+                    identity = parse_batch_custom_id(str(custom_id))
+                except Exception as e:
+                    errors += 1
+                    print(f"  {custom_id}: invalid custom_id ({e})")
+                    continue
+                output_text = _extract_output_text_from_batch_response_body(body) if body else None
+                if not output_text:
+                    errors += 1
+                    print(f"  {identity['TaskId']}: no output text in response")
+                    continue
+                try:
+                    raw_result = json.loads(output_text)
+                except json.JSONDecodeError as e:
+                    errors += 1
+                    print(f"  {identity['TaskId']}: JSON parse error {e}")
+                    continue
+
+                task = fetch_task_by_identity(
+                    con=con,
+                    task_id=identity["TaskId"],
+                    prompt_version=identity["PromptVersion"],
+                    embedding_model=identity["EmbeddingModel"],
+                )
+                if not task:
+                    errors += 1
+                    print(f"  {identity['TaskId']}: task not found in DB")
+                    continue
+
+                prepared = prepare_recovery_inputs(con, task, fallback_top_n)
+                pool = prepared["pool"]
+                stage = prepared["stage"]
+                candidate_pool_type = prepared["candidate_pool_type"]
+                if not pool:
+                    result = build_empty_pool_recovery_result(stage)
+                    save_recovery_result(
+                        con=con,
+                        task=task,
+                        stage=stage,
+                        model=model,
+                        candidate_pool_type=candidate_pool_type,
+                        candidate_pool_size=0,
+                        result=result,
+                        manage_transaction=False,
+                    )
+                    saved += 1
+                    print(f"  {identity['TaskId']} -> NO_MATCH (saved from empty pool)")
+                    continue
+
+                try:
+                    validated = validate_recovery_output(stage=stage, result=raw_result, pool=pool)
+                    save_recovery_result(
+                        con=con,
+                        task=task,
+                        stage=stage,
+                        model=model,
+                        candidate_pool_type=candidate_pool_type,
+                        candidate_pool_size=len(pool),
+                        result=validated,
+                        manage_transaction=False,
+                    )
+                    saved += 1
+                    print(f"  {identity['TaskId']} -> {validated['RecoveryDecisionType']} (saved)")
+                except Exception as e:
+                    errors += 1
+                    print(f"  {identity['TaskId']}: validation/save error {e}")
+
+        if error_file_id:
+            err_content = client.files.content(error_file_id).content
+            for line in err_content.decode("utf-8").strip().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                custom_id = row.get("custom_id")
+                if custom_id:
+                    try:
+                        identity = parse_batch_custom_id(str(custom_id))
+                        print(f"  {identity['TaskId']}: batch error (see error file)")
+                    except Exception:
+                        print(f"  {custom_id}: batch error (see error file)")
+                    errors += 1
+        con.execute("COMMIT;")
+    except Exception:
+        con.execute("ROLLBACK;")
+        raise
+
+    print(f"Batch collect done: {saved} saved, {errors} errors.")
 
 
 def _increment_stats(
@@ -833,6 +1449,7 @@ def _increment_stats(
 def _worker(
     task_queue: queue.Queue,
     model: str,
+    fallback_top_n: int,
     print_lock: threading.Lock,
     total_tasks: int,
     completed_count: List[int],
@@ -852,7 +1469,7 @@ def _worker(
                         f"[{threading.current_thread().name}] "
                         f"{stage} ({task['FinalDecisionType']}) -> {task['Document_title']}"
                     )
-                result = process_one_task(con, task, model)
+                result = process_one_task(con, task, model, fallback_top_n)
                 with print_lock:
                     if result:
                         _increment_stats(
@@ -863,7 +1480,8 @@ def _worker(
                         print(
                             f"  Saved -> {result['RecoveryDecisionType']} "
                             f"titlekey={result.get('RecoveryTitleKey')} "
-                            f"mode={result['RecoveryMode']}"
+                            f"mode={result['RecoveryMode']} "
+                            f"pool={result.get('UsedCandidatePoolType')}"
                         )
             except Exception as e:
                 with print_lock:
@@ -920,12 +1538,75 @@ def main():
         action="store_true",
         help="Reprocess tasks even if a recovery result already exists for the same stage.",
     )
+    ap.add_argument(
+        "--fallback-top-n",
+        type=int,
+        default=DEFAULT_FALLBACK_TOP_N,
+        help=(
+            "Always merge top-N RAG candidates into the single-pass recovery pool, "
+            "tagged as RAG_FALLBACK, while keeping AGENT_TOP3 candidates as the preferred "
+            f"source by policy (default: {DEFAULT_FALLBACK_TOP_N})."
+        ),
+    )
+    ap.add_argument(
+        "--batch",
+        action="store_true",
+        help="Use OpenAI Batch API: submit recovery tasks and exit.",
+    )
+    ap.add_argument(
+        "--batch-collect",
+        action="store_true",
+        help="Poll batch until completed and write recovery results to DB.",
+    )
+    ap.add_argument(
+        "--batch-id",
+        default=None,
+        help="Batch ID for --batch-collect (default: read from .recovery_last_batch_id).",
+    )
+    ap.add_argument(
+        "--poll-interval",
+        type=int,
+        default=60,
+        help="Polling interval in seconds for --batch-collect.",
+    )
     args = ap.parse_args()
+
+    if args.batch and args.batch_collect:
+        raise RuntimeError("Use either --batch or --batch-collect, not both.")
 
     prompt_version = args.prompt_version or _cfg("PROMPT_VERSION")
     if not prompt_version:
         raise RuntimeError("Specificare --prompt-version o impostare PROMPT_VERSION in config.txt")
     model = args.model or DEFAULT_MODEL
+
+    if args.batch_collect:
+        batch_id = (args.batch_id or "").strip() or (
+            BATCH_ID_FILE.read_text(encoding="utf-8").strip() if BATCH_ID_FILE.exists() else ""
+        )
+        if not batch_id:
+            raise RuntimeError("Error: no --batch-id and no .recovery_last_batch_id file.")
+        meta = load_batch_meta(batch_id)
+        collect_model = (meta or {}).get("model") or model
+        collect_fallback_top_n = int((meta or {}).get("fallback_top_n") or args.fallback_top_n)
+        print(f"Collecting recovery batch: {batch_id}")
+        if meta:
+            print(
+                f"Using batch metadata: model={collect_model}, "
+                f"top_n={collect_fallback_top_n}, mode={meta.get('mode')}"
+            )
+        con = connect_motherduck()
+        try:
+            ensure_recovery_results_table(con)
+            run_batch_collect(
+                con=con,
+                batch_id=batch_id,
+                model=collect_model,
+                fallback_top_n=collect_fallback_top_n,
+                poll_interval=max(1, int(args.poll_interval or 60)),
+            )
+        finally:
+            con.close()
+        return
 
     con = connect_motherduck()
     try:
@@ -945,6 +1626,36 @@ def main():
         print("No tasks found for recovery.")
         return
 
+    if args.batch:
+        print(f"Tasks to submit in batch: {len(tasks)}")
+        con = connect_motherduck()
+        try:
+            ensure_recovery_results_table(con)
+            batch_info = run_batch_submit(
+                con=con,
+                tasks=tasks,
+                model=model,
+                fallback_top_n=args.fallback_top_n,
+                mode=args.mode,
+                prompt_version=prompt_version,
+                embedding_model=args.embedding_model,
+                rerun_existing=args.rerun_existing,
+            )
+        finally:
+            con.close()
+        if batch_info["saved_without_batch"]:
+            print(
+                f"Saved immediately without batch: {batch_info['saved_without_batch']} "
+                f"(empty merged pool)."
+            )
+        if batch_info["batch_id"]:
+            print(f"Batch submitted: {batch_info['batch_id']}")
+            print(f"Submitted requests: {batch_info['submitted_count']}")
+            print("Run with --batch-collect later to write batch results to DB.")
+        else:
+            print("No LLM batch submitted; only deterministic empty-pool tasks were saved.")
+        return
+
     print(f"Tasks to process: {len(tasks)}")
     task_queue: queue.Queue = queue.Queue()
     for task in tasks:
@@ -958,7 +1669,15 @@ def main():
     for i in range(n_workers):
         t = threading.Thread(
             target=_worker,
-            args=(task_queue, model, print_lock, len(tasks), completed_count, stats),
+            args=(
+                task_queue,
+                model,
+                args.fallback_top_n,
+                print_lock,
+                len(tasks),
+                completed_count,
+                stats,
+            ),
             name=f"recovery-{i+1}",
             daemon=True,
         )

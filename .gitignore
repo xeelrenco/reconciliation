@@ -9,3 +9,5 @@ Documentazione/~$ano di riconciliazione.docx
 .recon_test_tasks.json
 renco_riconciliazione_report_with_top3.xlsx
 __pycache__/
+.recovery_last_batch_id
+.recovery_last_batch_meta.json
