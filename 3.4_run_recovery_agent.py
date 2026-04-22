@@ -572,11 +572,12 @@ RECOVERY_SCHEMA = {
 }
 
 
-def _responses_batch_request_body(model: str, user_prompt: str) -> Dict[str, Any]:
+def _responses_batch_request_body(model: str, stage: str, user_prompt: str) -> Dict[str, Any]:
+    system_prompt = build_system_prompt(stage)
     return {
         "model": model,
         "input": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
         "text": {
@@ -606,7 +607,7 @@ def _extract_output_text_from_batch_response_body(body: Dict[str, Any]) -> Optio
     return None
 
 
-SYSTEM_PROMPT = """
+BASE_SYSTEM_PROMPT = """
 You are a recovery agent for MDR-to-RACI reconciliation.
 
 You are invoked only after the main reconciliation pipeline has already run.
@@ -790,6 +791,40 @@ Output JSON only with:
 - recovery_mode
 """
 
+MANUAL_REVIEW_SYSTEM_ADDON = """
+
+Manual-review resolver preference:
+- In manual_review_resolver mode, when more than one candidate remains plausible, prefer the least-risk title family that a document controller would most likely have intended, rather than an over-specialized or over-detailed variant.
+- In practice, this means:
+  * prefer a semantically close standard/general family over a narrower special/critical-item family unless the MDR explicitly signals that special/critical scope,
+  * prefer the same requested view/working level (layout, plan, general arrangement, bulk material list, reinforcement details, foundation plan) over a more detailed or differently purposed neighboring document,
+  * when a direct family-level match exists, do not over-penalize it just because another candidate is more specific but also more interpretive or lower-level,
+  * if multiple upstream agents converge on the same plausible candidate, treat that as positive evidence unless a clearly better same-subject title exists,
+  * for building/civil/structural titles, prefer ordinary building-level RC/steel families over special/critical-item families unless the MDR explicitly names a special/critical item,
+  * for building/civil/structural titles, if no exact same-building title exists but an ordinary reinforcement/foundation/steel drawing family remains a plausible building-level proxy, prefer that least-risk family-level match over NO_MATCH,
+  * for panel/switchboard titles, prefer the candidate preserving the panel/switchboard family and documentary role over one that preserves only a technology qualifier,
+  * for underground/network/layout titles, prefer the direct network/layout family over neighboring plot-plan or subsystem-detail families,
+  * when the MDR names a combined or neighboring pair of systems/components in one deliverable and no candidate cleanly covers both, you may still choose the least-risk family-level candidate that preserves the requested document role and the dominant shared context instead of forcing NO_MATCH,
+  * in manual review, strictness rules are still important, but they should not eliminate an otherwise credible best-available candidate when the remaining mismatch is only partial scope loss rather than a true subject change.
+"""
+
+
+NO_MATCH_SYSTEM_ADDON = """
+
+No-match recovery preference:
+- In no_match_recovery mode, use a more conservative threshold before overturning an existing NO_MATCH.
+- Prefer MATCH only when one candidate is clearly credible on the same primary subject after applying the strict exceptions above.
+- If the pool offers only partial, neighboring, or role-shifted proxies, confirm NO_MATCH rather than forcing a recovery.
+"""
+
+
+def build_system_prompt(stage: str) -> str:
+    if stage == STAGE_MANUAL_REVIEW:
+        return BASE_SYSTEM_PROMPT + MANUAL_REVIEW_SYSTEM_ADDON
+    if stage == STAGE_NO_MATCH:
+        return BASE_SYSTEM_PROMPT + NO_MATCH_SYSTEM_ADDON
+    return BASE_SYSTEM_PROMPT
+
 
 def build_user_prompt(
     stage: str,
@@ -874,6 +909,12 @@ def build_user_prompt(
     blocks.append("- For study/specification titles, do not prefer a much narrower or cross-discipline study only because it contains the word 'study'.")
     blocks.append("- For façade precast panel drawings without any true façade/precast proxy in pool, generic RC building/foundation drawings are usually too weak, so prefer NO_MATCH.")
     blocks.append("- For spare-parts lists and lifting/installation procedure-plans, preserve that operational role directly; generic manuals, vendor bundles, or generic lists are usually too weak.")
+    if stage == STAGE_MANUAL_REVIEW:
+        blocks.append("- In manual review, when several candidates are plausible, lean toward the least-risk standard/general family that preserves the intended document level instead of a more specialized or over-detailed variant.")
+        blocks.append("- In manual review, if no candidate cleanly covers every combined sub-scope, do not force NO_MATCH too early: a best-available family-level layout/drawing/list/spec can still be acceptable when it preserves the main shared context and document role better than the rest of the pool.")
+        blocks.append("- In manual review building/civil/structural cases, if the pool lacks the exact building title but contains a plausible ordinary reinforcement/foundation/steel family, prefer that ordinary building-level proxy over NO_MATCH or over a special/critical-item family.")
+    elif stage == STAGE_NO_MATCH:
+        blocks.append("- In no-match recovery, overturn the baseline NO_MATCH only when a candidate is clearly credible on the same primary subject; partial or role-shifted proxies should usually remain NO_MATCH.")
     blocks.append("- Prefer AGENT_TOP3 candidates by default; use a RAG_FALLBACK candidate only when it is clearly better on the same subject.")
     blocks.append("- Use tie-breakers only after the rules above, and explain the chosen trade-off briefly in reasoning_summary.")
     blocks.append("")
@@ -892,6 +933,7 @@ def call_recovery_agent(
     pool: List[Dict[str, Any]],
     fallback_top_n: int = DEFAULT_FALLBACK_TOP_N,
 ) -> Dict[str, Any]:
+    system_prompt = build_system_prompt(stage)
     user_prompt = build_user_prompt(
         stage=stage,
         task=task,
@@ -905,7 +947,7 @@ def call_recovery_agent(
     resp = client.responses.create(
         model=model,
         input=[
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
         text={
@@ -1236,7 +1278,7 @@ def run_batch_submit(
             pool=pool,
             fallback_top_n=fallback_top_n,
         )
-        body = _responses_batch_request_body(model, user_prompt)
+        body = _responses_batch_request_body(model, stage, user_prompt)
         custom_id = make_batch_custom_id(task)
         lines.append(
             json.dumps(
