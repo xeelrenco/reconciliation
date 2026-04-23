@@ -10,12 +10,12 @@ Uso in tempo reale (default)
   python 3.1_run_agent1_gpt.py [--prompt-version v1] [--embedding-model ...] [--limit N] [--workers 4] [--model ...]
 
 Uso con Batch API (rate limit separati, ~50% costo)
-  1) Submit: invia i task pending in un batch (elaborazione asincrona, entro 24h).
-     python 3.1_run_agent1_gpt.py --batch [--limit N]
-     L'id del batch viene salvato in .agent1_last_batch_id.
+  1) Submit: invia i task pending in batch chunked automatici (elaborazione asincrona, entro 24h).
+     python 3.1_run_agent1_gpt.py --batch [--limit N] [--batch-max-bytes 120000000]
+     Ogni chunk genera un batch id; la lista viene salvata in .agent1_last_batch_ids.json.
   2) Collect: quando il batch è completato, scarica i risultati e scrive in DB.
      python 3.1_run_agent1_gpt.py --batch-collect
-     Oppure: python 3.1_run_agent1_gpt.py --batch-collect --batch-id <id>
+     Colleziona automaticamente tutti i batch dell'ultimo submit (anche se è uno solo).
 
 Stati Agent1Status (batch): pending | submitted_{batch_id} | in_batch_{batch_id} | done | error_{batch_id}
   (solo 'done' senza suffisso; gli altri stati batch hanno _batch_id per tracciare il batch.)
@@ -28,6 +28,7 @@ import threading
 import tempfile
 import time
 import random
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -39,9 +40,11 @@ from openai import OpenAI
 # Config da file (stesso formato degli altri script)
 # -----------------------------
 CONFIG_PATH = Path(__file__).resolve().parent / "config.txt"
-BATCH_ID_FILE = Path(__file__).resolve().parent / ".agent1_last_batch_id"
+BATCH_IDS_FILE = Path(__file__).resolve().parent / ".agent1_last_batch_ids.json"
 BATCH_ENDPOINT = "/v1/responses"
 TEST_TASK_FILE = Path(__file__).resolve().parent / ".recon_test_tasks.json"
+OPENAI_BATCH_INPUT_FILE_HARD_LIMIT_BYTES = 209_715_200  # 200 MB
+DEFAULT_BATCH_TARGET_BYTES = 120_000_000  # conservative default to reduce token-queue failures
 
 
 def load_config(path: Optional[Path] = None) -> Dict[str, str]:
@@ -660,35 +663,47 @@ def _extract_output_text_from_batch_response_body(body: Dict[str, Any]) -> Optio
     return None
 
 
-def run_batch_submit(
+def _batch_obj_to_debug_json(batch: Any) -> str:
+    """Serialize SDK batch object for readable debug logging."""
+    try:
+        if hasattr(batch, "model_dump"):
+            return json.dumps(batch.model_dump(), ensure_ascii=False, indent=2, default=str)
+        if hasattr(batch, "to_dict"):
+            return json.dumps(batch.to_dict(), ensure_ascii=False, indent=2, default=str)
+        if isinstance(batch, dict):
+            return json.dumps(batch, ensure_ascii=False, indent=2, default=str)
+    except Exception:
+        pass
+    return repr(batch)
+
+
+def _build_batch_line_for_task(
     con: duckdb.DuckDBPyConnection,
-    tasks: List[Dict[str, Any]],
+    task: Dict[str, Any],
     model: str,
-) -> str:
-    """Build JSONL, upload file, create batch, mark tasks submitted_{batch_id}. Returns batch id."""
-    lines: List[str] = []
-    submitted_task_ids: List[str] = []
-    for task in tasks:
-        candidates = fetch_candidates_for_task(
-            con=con,
-            document_title=task["Document_title"],
-            prompt_version=task["PromptVersion"],
-            embedding_model=task["EmbeddingModel"],
-        )
-        if not candidates:
-            continue
-        mdr_ctx = fetch_mdr_context(con, task["Document_title"])
-        user_prompt = build_user_prompt(mdr_ctx, candidates)
-        body = _responses_batch_request_body(model, user_prompt)
-        lines.append(json.dumps({
-            "custom_id": task["TaskId"],
-            "method": "POST",
-            "url": BATCH_ENDPOINT,
-            "body": body,
-        }))
-        submitted_task_ids.append(task["TaskId"])
-    if not lines:
-        raise RuntimeError("No valid tasks to submit (all missing candidates?).")
+) -> Optional[Dict[str, Any]]:
+    candidates = fetch_candidates_for_task(
+        con=con,
+        document_title=task["Document_title"],
+        prompt_version=task["PromptVersion"],
+        embedding_model=task["EmbeddingModel"],
+    )
+    if not candidates:
+        return None
+    mdr_ctx = fetch_mdr_context(con, task["Document_title"])
+    user_prompt = build_user_prompt(mdr_ctx, candidates)
+    body = _responses_batch_request_body(model, user_prompt)
+    line = json.dumps({
+        "custom_id": task["TaskId"],
+        "method": "POST",
+        "url": BATCH_ENDPOINT,
+        "body": body,
+    })
+    line_bytes = len((line + "\n").encode("utf-8"))
+    return {"task_id": task["TaskId"], "line": line, "line_bytes": line_bytes}
+
+
+def _submit_batch_chunk(lines: List[str]) -> Any:
     with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False, encoding="utf-8") as f:
         for line in lines:
             f.write(line + "\n")
@@ -701,21 +716,118 @@ def run_batch_submit(
             endpoint=BATCH_ENDPOINT,
             completion_window="24h",
         )
-        batch_id = batch.id
+        return batch
     finally:
         Path(tmp_path).unlink(missing_ok=True)
+
+
+def run_batch_submit(
+    con: duckdb.DuckDBPyConnection,
+    tasks: List[Dict[str, Any]],
+    model: str,
+) -> List[str]:
+    """Create one or more batch submissions under size target; returns submitted batch ids."""
+    return run_batch_submit_chunked(con=con, tasks=tasks, model=model, target_max_bytes=DEFAULT_BATCH_TARGET_BYTES)
+
+
+def run_batch_submit_chunked(
+    con: duckdb.DuckDBPyConnection,
+    tasks: List[Dict[str, Any]],
+    model: str,
+    target_max_bytes: int,
+) -> List[str]:
+    """Build/submit chunked batch files to stay below OpenAI file-size limits."""
+    if target_max_bytes <= 0:
+        raise ValueError("target_max_bytes must be > 0")
+    if target_max_bytes > OPENAI_BATCH_INPUT_FILE_HARD_LIMIT_BYTES:
+        raise ValueError(
+            f"target_max_bytes cannot exceed hard limit {OPENAI_BATCH_INPUT_FILE_HARD_LIMIT_BYTES}"
+        )
+
+    current_lines: List[str] = []
+    current_task_ids: List[str] = []
+    current_bytes = 0
+    batch_ids: List[str] = []
+    valid_rows = 0
+    total_bytes = 0
+    skipped_too_large = 0
     ts = now_ts_naive_utc()
-    status_submitted = f"submitted_{batch_id}"
-    for task_id in submitted_task_ids:
-        con.execute("""
-            UPDATE my_db.mdr_reconciliation.MdrReconciliationTasks
-            SET Agent1Status = ?,
-                FinalStatus = CASE WHEN FinalStatus = 'pending' THEN 'in_progress' ELSE FinalStatus END,
-                UpdatedAt = ?
-            WHERE TaskId = ?
-        """, [status_submitted, ts, task_id])
-    BATCH_ID_FILE.write_text(batch_id, encoding="utf-8")
-    return batch_id
+
+    def flush_chunk() -> None:
+        nonlocal current_lines, current_task_ids, current_bytes
+        if not current_lines:
+            return
+        batch = _submit_batch_chunk(current_lines)
+        batch_id = batch.id
+        status_submitted = f"submitted_{batch_id}"
+        for task_id in current_task_ids:
+            con.execute("""
+                UPDATE my_db.mdr_reconciliation.MdrReconciliationTasks
+                SET Agent1Status = ?,
+                    FinalStatus = CASE WHEN FinalStatus = 'pending' THEN 'in_progress' ELSE FinalStatus END,
+                    UpdatedAt = ?
+                WHERE TaskId = ?
+            """, [status_submitted, ts, task_id])
+        batch_ids.append(batch_id)
+        # Persist after each submitted chunk so partial progress is recoverable on later failures.
+        BATCH_IDS_FILE.write_text(
+            json.dumps(batch_ids, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(
+            f"Submitted chunk {len(batch_ids)}: batch_id={batch_id}, "
+            f"tasks={len(current_task_ids)}, jsonl_bytes={current_bytes}"
+        )
+        current_lines = []
+        current_task_ids = []
+        current_bytes = 0
+
+    total_tasks = len(tasks)
+    for i, task in enumerate(tasks, start=1):
+        row = _build_batch_line_for_task(con=con, task=task, model=model)
+        if i % 100 == 0 or i == total_tasks:
+            print(f"Batch build progress: {i}/{total_tasks}")
+        if not row:
+            continue
+        line = row["line"]
+        line_bytes = int(row["line_bytes"])
+        task_id = str(row["task_id"])
+        if line_bytes > target_max_bytes:
+            mark_agent1_error(con, task_id)
+            skipped_too_large += 1
+            print(
+                f"  {task_id}: skipped (single request {line_bytes} bytes exceeds target {target_max_bytes})"
+            )
+            continue
+        if current_lines and (current_bytes + line_bytes > target_max_bytes):
+            flush_chunk()
+        current_lines.append(line)
+        current_task_ids.append(task_id)
+        current_bytes += line_bytes
+        valid_rows += 1
+        total_bytes += line_bytes
+
+    flush_chunk()
+
+    if valid_rows == 0:
+        raise RuntimeError("No valid tasks to submit (all missing candidates?).")
+
+    avg_bytes = total_bytes / max(valid_rows, 1)
+    estimated_tasks_per_batch = max(1, int(target_max_bytes // max(avg_bytes, 1)))
+    estimated_batch_count = math.ceil(valid_rows / estimated_tasks_per_batch)
+    print(
+        "Batch sizing summary: "
+        f"valid_tasks={valid_rows}, avg_request_bytes={avg_bytes:.0f}, "
+        f"target_max_bytes={target_max_bytes}, "
+        f"estimated_tasks_per_batch={estimated_tasks_per_batch}, "
+        f"estimated_batches={estimated_batch_count}, "
+        f"submitted_batches={len(batch_ids)}, skipped_too_large={skipped_too_large}"
+    )
+    BATCH_IDS_FILE.write_text(
+        json.dumps(batch_ids, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return batch_ids
 
 
 def run_batch_collect(
@@ -732,6 +844,8 @@ def run_batch_collect(
             break
         if status in ("failed", "canceled", "expired"):
             print(f"Batch {batch_id} ended with status={status}. Cannot collect results.")
+            print("Batch API response:")
+            print(_batch_obj_to_debug_json(batch))
             return
         print(f"Batch {batch_id} status={status}, waiting {poll_interval}s...")
         time.sleep(poll_interval)
@@ -891,10 +1005,18 @@ def main():
     ap.add_argument("--embedding-model", default=None, help="EmbeddingModel (default: from config.txt EMBEDDING_MODEL).")
     ap.add_argument("--limit", type=int, default=None, help="Max number of tasks to process (default: no limit, process all pending).")
     ap.add_argument("--workers", type=int, default=4, help="Number of parallel workers (default: 4).")
-    ap.add_argument("--model", default=None, help="OpenAI model for agent (default: from config OPENAI_AGENT1_MODEL or gpt-4o-mini).")
+    ap.add_argument("--model", default=None, help="OpenAI model for agent (default: from config OPENAI_AGENT1_MODEL or gpt-5-mini).")
     ap.add_argument("--batch", action="store_true", help="Use Batch API: submit pending tasks and exit (collect later with --batch-collect).")
-    ap.add_argument("--batch-collect", action="store_true", help="Poll batch until completed and write results to DB. Use --batch-id or .agent1_last_batch_id.")
-    ap.add_argument("--batch-id", default=None, help="Batch ID for --batch-collect (default: read from .agent1_last_batch_id).")
+    ap.add_argument("--batch-collect", action="store_true", help="Poll and collect all batch ids saved by latest submit in .agent1_last_batch_ids.json.")
+    ap.add_argument(
+        "--batch-max-bytes",
+        type=int,
+        default=DEFAULT_BATCH_TARGET_BYTES,
+        help=(
+            "Target max JSONL bytes per submitted batch chunk "
+            f"(default: {DEFAULT_BATCH_TARGET_BYTES}, hard max: {OPENAI_BATCH_INPUT_FILE_HARD_LIMIT_BYTES})."
+        ),
+    )
     ap.add_argument("--test-fixed-tasks", action="store_true", help="Test mode: use a shared fixed list of TaskId stored in .recon_test_tasks.json.")
     ap.add_argument("--test-task-count", type=int, default=150, help="Number of random TaskId to pick when creating the shared test list (default: 150).")
     args = ap.parse_args()
@@ -908,13 +1030,27 @@ def main():
     ensure_agent_top_candidates_table(con)
 
     if args.batch_collect:
-        batch_id = (args.batch_id or "").strip() or (BATCH_ID_FILE.read_text(encoding="utf-8").strip() if BATCH_ID_FILE.exists() else "")
-        if not batch_id:
-            print("Error: no --batch-id and no .agent1_last_batch_id file.")
+        if not BATCH_IDS_FILE.exists():
+            print("Error: no .agent1_last_batch_ids.json file. Run --batch first.")
             con.close()
             return
-        print(f"Collecting results for batch: {batch_id}")
-        run_batch_collect(con=con, batch_id=batch_id, model=args.model)
+        try:
+            batch_ids = json.loads(BATCH_IDS_FILE.read_text(encoding="utf-8"))
+            if not isinstance(batch_ids, list):
+                raise ValueError("invalid JSON shape")
+            batch_ids = [str(x).strip() for x in batch_ids if str(x).strip()]
+        except Exception as e:
+            print(f"Error reading {BATCH_IDS_FILE.name}: {e}")
+            con.close()
+            return
+        if not batch_ids:
+            print("No batch ids to collect.")
+            con.close()
+            return
+        print(f"Collecting {len(batch_ids)} batch(es) from {BATCH_IDS_FILE.name}...")
+        for i, batch_id in enumerate(batch_ids, start=1):
+            print(f"[{i}/{len(batch_ids)}] Collecting results for batch: {batch_id}")
+            run_batch_collect(con=con, batch_id=batch_id, model=args.model)
         con.close()
         return
 
@@ -931,10 +1067,21 @@ def main():
             print("No pending tasks for batch.")
             con.close()
             return
-        batch_id = run_batch_submit(con=con, tasks=tasks, model=args.model)
+        batch_ids = run_batch_submit_chunked(
+            con=con,
+            tasks=tasks,
+            model=args.model,
+            target_max_bytes=args.batch_max_bytes,
+        )
         con.close()
-        print(f"Batch submitted: {batch_id}")
-        print("Run with --batch-collect later to write results to DB (or use --batch-id if you save it).")
+        if len(batch_ids) == 1:
+            print(f"Batch submitted: {batch_ids[0]}")
+        else:
+            print(
+                f"Batches submitted: {len(batch_ids)} (last={batch_ids[-1]}). "
+                "Use --batch-collect to collect all results."
+            )
+        print("Run with --batch-collect later to write results to DB.")
         return
 
     tasks = fetch_pending_tasks(

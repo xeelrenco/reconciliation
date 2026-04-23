@@ -29,7 +29,7 @@ Usage:
   python 3.4_run_recovery_agent.py --mode both --limit 50 --workers 4
   python 3.4_run_recovery_agent.py --mode both --batch --limit 200
   python 3.4_run_recovery_agent.py --batch-collect
-  python 3.4_run_recovery_agent.py --batch-collect --batch-id <id>
+  --batch-collect reads all ids from .recovery_last_batch_metas.json
 """
 
 import argparse
@@ -39,6 +39,7 @@ import re
 import threading
 import tempfile
 import time
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -48,9 +49,11 @@ from openai import OpenAI
 
 
 CONFIG_PATH = Path(__file__).resolve().parent / "config.txt"
-BATCH_ID_FILE = Path(__file__).resolve().parent / ".recovery_last_batch_id"
 BATCH_META_FILE = Path(__file__).resolve().parent / ".recovery_last_batch_meta.json"
+BATCH_METAS_FILE = Path(__file__).resolve().parent / ".recovery_last_batch_metas.json"
 BATCH_ENDPOINT = "/v1/responses"
+OPENAI_BATCH_INPUT_FILE_HARD_LIMIT_BYTES = 209_715_200
+DEFAULT_BATCH_TARGET_BYTES = 180_000_000
 
 
 def load_config(path: Optional[Path] = None) -> Dict[str, str]:
@@ -1218,20 +1221,24 @@ def process_one_task(
 
 
 def write_batch_meta(meta: Dict[str, Any]) -> None:
-    BATCH_ID_FILE.write_text(str(meta["batch_id"]), encoding="utf-8")
     BATCH_META_FILE.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    BATCH_METAS_FILE.write_text(json.dumps([meta], indent=2), encoding="utf-8")
 
 
-def load_batch_meta(batch_id: str) -> Optional[Dict[str, Any]]:
-    if not BATCH_META_FILE.exists():
-        return None
+def load_batch_metas() -> List[Dict[str, Any]]:
+    if not BATCH_METAS_FILE.exists():
+        return []
     try:
-        meta = json.loads(BATCH_META_FILE.read_text(encoding="utf-8"))
+        metas = json.loads(BATCH_METAS_FILE.read_text(encoding="utf-8"))
     except Exception:
-        return None
-    if str(meta.get("batch_id") or "").strip() != str(batch_id).strip():
-        return None
-    return meta
+        return []
+    if not isinstance(metas, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for item in metas:
+        if isinstance(item, dict) and str(item.get("batch_id") or "").strip():
+            out.append(item)
+    return out
 
 
 def run_batch_submit(
@@ -1244,9 +1251,90 @@ def run_batch_submit(
     embedding_model: Optional[str],
     rerun_existing: bool,
 ) -> Dict[str, Any]:
-    lines: List[str] = []
-    submitted_custom_ids: List[str] = []
+    return run_batch_submit_chunked(
+        con=con,
+        tasks=tasks,
+        model=model,
+        fallback_top_n=fallback_top_n,
+        mode=mode,
+        prompt_version=prompt_version,
+        embedding_model=embedding_model,
+        rerun_existing=rerun_existing,
+        target_max_bytes=DEFAULT_BATCH_TARGET_BYTES,
+    )
+
+
+def run_batch_submit_chunked(
+    con: duckdb.DuckDBPyConnection,
+    tasks: List[Dict[str, Any]],
+    model: str,
+    fallback_top_n: int,
+    mode: str,
+    prompt_version: str,
+    embedding_model: Optional[str],
+    rerun_existing: bool,
+    target_max_bytes: int,
+) -> Dict[str, Any]:
+    if target_max_bytes <= 0:
+        raise ValueError("target_max_bytes must be > 0")
+    if target_max_bytes > OPENAI_BATCH_INPUT_FILE_HARD_LIMIT_BYTES:
+        raise ValueError(
+            f"target_max_bytes cannot exceed hard limit {OPENAI_BATCH_INPUT_FILE_HARD_LIMIT_BYTES}"
+        )
+
+    current_lines: List[str] = []
+    current_custom_ids: List[str] = []
+    current_bytes = 0
+    batch_metas: List[Dict[str, Any]] = []
     saved_without_batch = 0
+    skipped_too_large = 0
+    total_submitted = 0
+    total_bytes = 0
+
+    def flush_chunk() -> None:
+        nonlocal current_lines, current_custom_ids, current_bytes
+        if not current_lines:
+            return
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False, encoding="utf-8") as f:
+            for line in current_lines:
+                f.write(line + "\n")
+            tmp_path = f.name
+        try:
+            with open(tmp_path, "rb") as f:
+                batch_file = client.files.create(file=f, purpose="batch")
+            batch = client.batches.create(
+                input_file_id=batch_file.id,
+                endpoint=BATCH_ENDPOINT,
+                completion_window="24h",
+            )
+            batch_id = batch.id
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+
+        meta = {
+            "batch_id": batch_id,
+            "model": model,
+            "fallback_top_n": int(fallback_top_n),
+            "mode": mode,
+            "prompt_version": prompt_version,
+            "embedding_model": embedding_model,
+            "rerun_existing": bool(rerun_existing),
+            "submitted_count": len(current_custom_ids),
+            "saved_without_batch": 0,
+            "submitted_at": now_ts_naive_utc().isoformat(),
+            "jsonl_bytes": current_bytes,
+        }
+        batch_metas.append(meta)
+        # Persist after each submitted chunk so partial progress is recoverable on later failures.
+        BATCH_META_FILE.write_text(json.dumps(batch_metas[-1], indent=2), encoding="utf-8")
+        BATCH_METAS_FILE.write_text(json.dumps(batch_metas, indent=2), encoding="utf-8")
+        print(
+            f"Submitted chunk {len(batch_metas)}: batch_id={batch_id}, "
+            f"requests={len(current_custom_ids)}, jsonl_bytes={current_bytes}"
+        )
+        current_lines = []
+        current_custom_ids = []
+        current_bytes = 0
 
     for task in tasks:
         prepared = prepare_recovery_inputs(con, task, fallback_top_n)
@@ -1280,58 +1368,52 @@ def run_batch_submit(
         )
         body = _responses_batch_request_body(model, stage, user_prompt)
         custom_id = make_batch_custom_id(task)
-        lines.append(
-            json.dumps(
-                {
-                    "custom_id": custom_id,
-                    "method": "POST",
-                    "url": BATCH_ENDPOINT,
-                    "body": body,
-                }
-            )
+        line = json.dumps(
+            {
+                "custom_id": custom_id,
+                "method": "POST",
+                "url": BATCH_ENDPOINT,
+                "body": body,
+            }
         )
-        submitted_custom_ids.append(custom_id)
+        line_bytes = len((line + "\n").encode("utf-8"))
+        if line_bytes > target_max_bytes:
+            skipped_too_large += 1
+            print(
+                f"  {task['TaskId']}: skipped (single request {line_bytes} bytes exceeds target {target_max_bytes})"
+            )
+            continue
+        if current_lines and (current_bytes + line_bytes > target_max_bytes):
+            flush_chunk()
+        current_lines.append(line)
+        current_custom_ids.append(custom_id)
+        current_bytes += line_bytes
+        total_submitted += 1
+        total_bytes += line_bytes
 
-    if not lines:
+    flush_chunk()
+
+    if not batch_metas:
         return {
-            "batch_id": None,
+            "batch_ids": [],
             "submitted_count": 0,
             "saved_without_batch": saved_without_batch,
         }
-
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False, encoding="utf-8") as f:
-        for line in lines:
-            f.write(line + "\n")
-        tmp_path = f.name
-
-    try:
-        with open(tmp_path, "rb") as f:
-            batch_file = client.files.create(file=f, purpose="batch")
-        batch = client.batches.create(
-            input_file_id=batch_file.id,
-            endpoint=BATCH_ENDPOINT,
-            completion_window="24h",
-        )
-        batch_id = batch.id
-    finally:
-        Path(tmp_path).unlink(missing_ok=True)
-
-    meta = {
-        "batch_id": batch_id,
-        "model": model,
-        "fallback_top_n": int(fallback_top_n),
-        "mode": mode,
-        "prompt_version": prompt_version,
-        "embedding_model": embedding_model,
-        "rerun_existing": bool(rerun_existing),
-        "submitted_count": len(submitted_custom_ids),
-        "saved_without_batch": saved_without_batch,
-        "submitted_at": now_ts_naive_utc().isoformat(),
-    }
-    write_batch_meta(meta)
+    avg_bytes = total_bytes / max(total_submitted, 1)
+    estimated_per_batch = max(1, int(target_max_bytes // max(avg_bytes, 1)))
+    estimated_batches = math.ceil(total_submitted / estimated_per_batch)
+    print(
+        "Batch sizing summary: "
+        f"submitted_requests={total_submitted}, avg_request_bytes={avg_bytes:.0f}, "
+        f"target_max_bytes={target_max_bytes}, estimated_requests_per_batch={estimated_per_batch}, "
+        f"estimated_batches={estimated_batches}, submitted_batches={len(batch_metas)}, "
+        f"skipped_too_large={skipped_too_large}"
+    )
+    BATCH_META_FILE.write_text(json.dumps(batch_metas[-1], indent=2), encoding="utf-8")
+    BATCH_METAS_FILE.write_text(json.dumps(batch_metas, indent=2), encoding="utf-8")
     return {
-        "batch_id": batch_id,
-        "submitted_count": len(submitted_custom_ids),
+        "batch_ids": [m["batch_id"] for m in batch_metas],
+        "submitted_count": total_submitted,
         "saved_without_batch": saved_without_batch,
     }
 
@@ -1598,12 +1680,16 @@ def main():
     ap.add_argument(
         "--batch-collect",
         action="store_true",
-        help="Poll batch until completed and write recovery results to DB.",
+        help="Poll and collect all batch ids saved by latest submit in .recovery_last_batch_metas.json.",
     )
     ap.add_argument(
-        "--batch-id",
-        default=None,
-        help="Batch ID for --batch-collect (default: read from .recovery_last_batch_id).",
+        "--batch-max-bytes",
+        type=int,
+        default=DEFAULT_BATCH_TARGET_BYTES,
+        help=(
+            "Target max JSONL bytes per submitted batch chunk "
+            f"(default: {DEFAULT_BATCH_TARGET_BYTES}, hard max: {OPENAI_BATCH_INPUT_FILE_HARD_LIMIT_BYTES})."
+        ),
     )
     ap.add_argument(
         "--poll-interval",
@@ -1622,30 +1708,27 @@ def main():
     model = args.model or DEFAULT_MODEL
 
     if args.batch_collect:
-        batch_id = (args.batch_id or "").strip() or (
-            BATCH_ID_FILE.read_text(encoding="utf-8").strip() if BATCH_ID_FILE.exists() else ""
-        )
-        if not batch_id:
-            raise RuntimeError("Error: no --batch-id and no .recovery_last_batch_id file.")
-        meta = load_batch_meta(batch_id)
-        collect_model = (meta or {}).get("model") or model
-        collect_fallback_top_n = int((meta or {}).get("fallback_top_n") or args.fallback_top_n)
-        print(f"Collecting recovery batch: {batch_id}")
-        if meta:
-            print(
-                f"Using batch metadata: model={collect_model}, "
-                f"top_n={collect_fallback_top_n}, mode={meta.get('mode')}"
-            )
+        metas = load_batch_metas()
+        if not metas:
+            raise RuntimeError("Error: no .recovery_last_batch_metas.json file or no valid batch ids.")
+        print(f"Collecting {len(metas)} recovery batch(es) from {BATCH_METAS_FILE.name}...")
         con = connect_motherduck()
         try:
             ensure_recovery_results_table(con)
-            run_batch_collect(
-                con=con,
-                batch_id=batch_id,
-                model=collect_model,
-                fallback_top_n=collect_fallback_top_n,
-                poll_interval=max(1, int(args.poll_interval or 60)),
-            )
+            for i, meta in enumerate(metas, start=1):
+                batch_id = str(meta.get("batch_id") or "").strip()
+                if not batch_id:
+                    continue
+                collect_model = str(meta.get("model") or model)
+                collect_fallback_top_n = int(meta.get("fallback_top_n") or args.fallback_top_n)
+                print(f"[{i}/{len(metas)}] Collecting recovery batch: {batch_id}")
+                run_batch_collect(
+                    con=con,
+                    batch_id=batch_id,
+                    model=collect_model,
+                    fallback_top_n=collect_fallback_top_n,
+                    poll_interval=max(1, int(args.poll_interval or 60)),
+                )
         finally:
             con.close()
         return
@@ -1673,7 +1756,7 @@ def main():
         con = connect_motherduck()
         try:
             ensure_recovery_results_table(con)
-            batch_info = run_batch_submit(
+            batch_info = run_batch_submit_chunked(
                 con=con,
                 tasks=tasks,
                 model=model,
@@ -1682,6 +1765,7 @@ def main():
                 prompt_version=prompt_version,
                 embedding_model=args.embedding_model,
                 rerun_existing=args.rerun_existing,
+                target_max_bytes=args.batch_max_bytes,
             )
         finally:
             con.close()
@@ -1690,8 +1774,14 @@ def main():
                 f"Saved immediately without batch: {batch_info['saved_without_batch']} "
                 f"(empty merged pool)."
             )
-        if batch_info["batch_id"]:
-            print(f"Batch submitted: {batch_info['batch_id']}")
+        if batch_info["batch_ids"]:
+            if len(batch_info["batch_ids"]) == 1:
+                print(f"Batch submitted: {batch_info['batch_ids'][0]}")
+            else:
+                print(
+                    f"Batches submitted: {len(batch_info['batch_ids'])} "
+                    f"(last={batch_info['batch_ids'][-1]})."
+                )
             print(f"Submitted requests: {batch_info['submitted_count']}")
             print("Run with --batch-collect later to write batch results to DB.")
         else:

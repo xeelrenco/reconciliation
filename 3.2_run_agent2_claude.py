@@ -10,12 +10,12 @@ Uso in tempo reale (default)
   python 3.2_run_agent2_claude.py [--prompt-version v1] [--embedding-model text-embedding-3-small] [--limit N] [--workers 4] [--model claude-sonnet-4-6]
 
 Uso con Batch API (niente rate limit, ~50% costo)
-  1) Submit: invia i task pending in un unico batch (elaborazione asincrona, di solito < 1h).
-     python 3.2_run_agent2_claude.py --batch [--limit N]
-     L'id del batch viene salvato in .agent2_last_batch_id.
-  2) Collect: quando il batch è terminato, scarica i risultati e scrive in DB.
+  1) Submit: invia i task pending in batch chunked automatici.
+     python 3.2_run_agent2_claude.py --batch [--limit N] [--batch-max-bytes 240000000]
+     Ogni chunk genera un batch id; la lista viene salvata in .agent2_last_batch_ids.json.
+  2) Collect: quando i batch sono terminati, scarica i risultati e scrive in DB.
      python 3.2_run_agent2_claude.py --batch-collect
-     Oppure: python 3.2_run_agent2_claude.py --batch-collect --batch-id <id>
+     Colleziona automaticamente tutti i batch dell'ultimo submit (anche se e' uno solo).
 
 Stati Agent2Status (batch): pending | submitted_{batch_id} | in_batch_{batch_id} | done | error_{batch_id}
   (solo 'done' senza suffisso; gli altri stati batch hanno _batch_id per tracciare il batch.)
@@ -27,19 +27,23 @@ import queue
 import threading
 import time
 import random
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import duckdb
 import anthropic
+import httpx
 
 # -----------------------------
 # Config da file (stesso formato degli altri script)
 # -----------------------------
 CONFIG_PATH = Path(__file__).resolve().parent / "config.txt"
-BATCH_ID_FILE = Path(__file__).resolve().parent / ".agent2_last_batch_id"
+BATCH_IDS_FILE = Path(__file__).resolve().parent / ".agent2_last_batch_ids.json"
 TEST_TASK_FILE = Path(__file__).resolve().parent / ".recon_test_tasks.json"
+CLAUDE_BATCH_REQUEST_HARD_LIMIT_BYTES = 256_000_000
+DEFAULT_BATCH_TARGET_BYTES = 240_000_000
 
 
 def load_config(path: Optional[Path] = None) -> Dict[str, str]:
@@ -659,49 +663,127 @@ def run_batch_submit(
     con: duckdb.DuckDBPyConnection,
     tasks: List[Dict[str, Any]],
     model: str,
-) -> str:
-    """Build batch requests, create batch, mark tasks as running, save batch id. Returns batch id."""
-    requests: List[Dict[str, Any]] = []
-    submitted_task_ids: List[str] = []
-    for task in tasks:
+) -> List[str]:
+    return run_batch_submit_chunked(
+        con=con,
+        tasks=tasks,
+        model=model,
+        target_max_bytes=DEFAULT_BATCH_TARGET_BYTES,
+    )
+
+
+def run_batch_submit_chunked(
+    con: duckdb.DuckDBPyConnection,
+    tasks: List[Dict[str, Any]],
+    model: str,
+    target_max_bytes: int,
+) -> List[str]:
+    """Build and submit multiple Claude batches under byte target."""
+    if target_max_bytes <= 0:
+        raise ValueError("target_max_bytes must be > 0")
+    if target_max_bytes > CLAUDE_BATCH_REQUEST_HARD_LIMIT_BYTES:
+        raise ValueError(
+            f"target_max_bytes cannot exceed hard limit {CLAUDE_BATCH_REQUEST_HARD_LIMIT_BYTES}"
+        )
+
+    current_requests: List[Dict[str, Any]] = []
+    current_task_ids: List[str] = []
+    current_bytes = 0
+    batch_ids: List[str] = []
+    valid_rows = 0
+    total_bytes = 0
+    skipped_too_large = 0
+    ts = now_ts_naive_utc()
+
+    def flush_chunk() -> None:
+        nonlocal current_requests, current_task_ids, current_bytes
+        if not current_requests:
+            return
+        batch = client.beta.messages.batches.create(requests=current_requests)
+        batch_id = batch.id
+        status_submitted = f"submitted_{batch_id}"
+        for task_id in current_task_ids:
+            con.execute("""
+                UPDATE my_db.mdr_reconciliation.MdrReconciliationTasks
+                SET Agent2Status = ?,
+                    FinalStatus = CASE WHEN FinalStatus = 'pending' THEN 'in_progress' ELSE FinalStatus END,
+                    UpdatedAt = ?
+                WHERE TaskId = ?
+            """, [status_submitted, ts, task_id])
+        batch_ids.append(batch_id)
+        # Persist after each submitted chunk so partial progress is recoverable on later failures.
+        BATCH_IDS_FILE.write_text(
+            json.dumps(batch_ids, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(
+            f"Submitted chunk {len(batch_ids)}: batch_id={batch_id}, "
+            f"tasks={len(current_task_ids)}, payload_bytes~={current_bytes}"
+        )
+        current_requests = []
+        current_task_ids = []
+        current_bytes = 0
+
+    total_tasks = len(tasks)
+    for i, task in enumerate(tasks, start=1):
         candidates = fetch_candidates_for_task(
             con=con,
             document_title=task["Document_title"],
             prompt_version=task["PromptVersion"],
             embedding_model=task["EmbeddingModel"],
         )
+        if i % 100 == 0 or i == total_tasks:
+            print(f"Batch build progress: {i}/{total_tasks}")
         if not candidates:
             continue
         mdr_ctx = fetch_mdr_context(con, task["Document_title"])
         user_prompt = build_user_prompt(mdr_ctx, candidates)
-        requests.append({
+        req = {
             "custom_id": task["TaskId"],
             "params": {
                 "model": model,
-                # allineato alla chiamata realtime per permettere risposte JSON complete
                 "max_tokens": 1200,
                 "system": SYSTEM_PROMPT,
                 "messages": [{"role": "user", "content": user_prompt}],
             },
-        })
-        submitted_task_ids.append(task["TaskId"])
-    if not requests:
+        }
+        req_bytes = len(json.dumps(req, ensure_ascii=False).encode("utf-8")) + 2
+        if req_bytes > target_max_bytes:
+            mark_agent2_error(con, str(task["TaskId"]))
+            skipped_too_large += 1
+            print(
+                f"  {task['TaskId']}: skipped (single request {req_bytes} bytes exceeds target {target_max_bytes})"
+            )
+            continue
+        if current_requests and (current_bytes + req_bytes > target_max_bytes):
+            flush_chunk()
+        current_requests.append(req)
+        current_task_ids.append(str(task["TaskId"]))
+        current_bytes += req_bytes
+        valid_rows += 1
+        total_bytes += req_bytes
+
+    flush_chunk()
+
+    if valid_rows == 0:
         raise RuntimeError("No valid tasks to submit (all missing candidates?).")
-    batch = client.beta.messages.batches.create(requests=requests)
-    batch_id = batch.id
-    ts = now_ts_naive_utc()
-    # Batch status: submitted_{batch_id} = task inviato in questo batch (poi done o error_{batch_id})
-    status_submitted = f"submitted_{batch_id}"
-    for task_id in submitted_task_ids:
-        con.execute("""
-            UPDATE my_db.mdr_reconciliation.MdrReconciliationTasks
-            SET Agent2Status = ?,
-                FinalStatus = CASE WHEN FinalStatus = 'pending' THEN 'in_progress' ELSE FinalStatus END,
-                UpdatedAt = ?
-            WHERE TaskId = ?
-        """, [status_submitted, ts, task_id])
-    BATCH_ID_FILE.write_text(batch_id, encoding="utf-8")
-    return batch_id
+
+    avg_bytes = total_bytes / max(valid_rows, 1)
+    estimated_tasks_per_batch = max(1, int(target_max_bytes // max(avg_bytes, 1)))
+    estimated_batch_count = math.ceil(valid_rows / estimated_tasks_per_batch)
+    print(
+        "Batch sizing summary: "
+        f"valid_tasks={valid_rows}, avg_request_bytes={avg_bytes:.0f}, "
+        f"target_max_bytes={target_max_bytes}, "
+        f"estimated_tasks_per_batch={estimated_tasks_per_batch}, "
+        f"estimated_batches={estimated_batch_count}, "
+        f"submitted_batches={len(batch_ids)}, skipped_too_large={skipped_too_large}"
+    )
+    BATCH_IDS_FILE.write_text(
+        json.dumps(batch_ids, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return batch_ids
 
 
 def run_batch_collect(
@@ -728,61 +810,88 @@ def run_batch_collect(
     """, [status_in_batch, now_ts_naive_utc(), status_submitted])
     saved = 0
     errors = 0
-    for item in client.beta.messages.batches.results(message_batch_id=batch_id):
-        custom_id = getattr(item, "custom_id", None) or (item.get("custom_id") if isinstance(item, dict) else None)
-        result = getattr(item, "result", None) or (item.get("result") if isinstance(item, dict) else None)
-        if not custom_id or not result:
-            continue
-        task_id = str(custom_id)
-        result_type = getattr(result, "type", None) or (result.get("type") if isinstance(result, dict) else None)
-        if result_type == "succeeded":
-            msg = getattr(result, "message", None) or (result.get("message") if isinstance(result, dict) else None)
-            if not msg:
-                mark_agent2_error(con, task_id, batch_id=batch_id)
-                errors += 1
+    # Stream can occasionally drop on large result sets; retry and skip already handled tasks.
+    handled_task_ids: set[str] = set()
+    stream_attempt = 0
+    max_stream_retries = 5
+    while True:
+        try:
+            for item in client.beta.messages.batches.results(message_batch_id=batch_id):
+                custom_id = getattr(item, "custom_id", None) or (item.get("custom_id") if isinstance(item, dict) else None)
+                result = getattr(item, "result", None) or (item.get("result") if isinstance(item, dict) else None)
+                if not custom_id or not result:
+                    continue
+                task_id = str(custom_id)
+                if task_id in handled_task_ids:
+                    continue
+                result_type = getattr(result, "type", None) or (result.get("type") if isinstance(result, dict) else None)
+                if result_type == "succeeded":
+                    msg = getattr(result, "message", None) or (result.get("message") if isinstance(result, dict) else None)
+                    if not msg:
+                        mark_agent2_error(con, task_id, batch_id=batch_id)
+                        errors += 1
+                        handled_task_ids.add(task_id)
+                        continue
+                    raw_text = _extract_text_from_batch_message(msg)
+                    try:
+                        cleaned = extract_json_payload(raw_text)
+                        raw_result = json.loads(cleaned)
+                    except (json.JSONDecodeError, ValueError) as e:
+                        mark_agent2_error(con, task_id, batch_id=batch_id)
+                        errors += 1
+                        handled_task_ids.add(task_id)
+                        print(f"  {task_id}: parse error {e}")
+                        print("    ---- CLAUDE BATCH RAW TEXT BEGIN ----")
+                        print(raw_text)
+                        print("    ---- CLAUDE BATCH RAW TEXT END ----")
+                        print("    ---- CLAUDE BATCH CLEANED JSON BEGIN ----")
+                        print(cleaned)
+                        print("    ---- CLAUDE BATCH CLEANED JSON END ----")
+                        continue
+                    row = con.execute("""
+                        SELECT TaskId, Document_title, PromptVersion, EmbeddingModel
+                        FROM my_db.mdr_reconciliation.MdrReconciliationTasks
+                        WHERE TaskId = ?
+                    """, [task_id]).fetchone()
+                    if not row:
+                        errors += 1
+                        handled_task_ids.add(task_id)
+                        continue
+                    task = {"TaskId": row[0], "Document_title": row[1], "PromptVersion": row[2], "EmbeddingModel": row[3]}
+                    candidates = fetch_candidates_for_task(con, task["Document_title"], task["PromptVersion"], task["EmbeddingModel"])
+                    if not candidates:
+                        mark_agent2_error(con, task_id, batch_id=batch_id)
+                        errors += 1
+                        handled_task_ids.add(task_id)
+                        continue
+                    try:
+                        validated = validate_agent_output(raw_result, candidates)
+                        save_agent2_evaluation(con=con, task=task, model=model, result=validated)
+                        saved += 1
+                        handled_task_ids.add(task_id)
+                        print(f"  {task_id} -> {validated['DecisionType']} (saved)")
+                    except Exception as e:
+                        mark_agent2_error(con, task_id, batch_id=batch_id)
+                        errors += 1
+                        handled_task_ids.add(task_id)
+                        print(f"  {task_id}: validation/save error {e}")
+                else:
+                    mark_agent2_error(con, task_id, batch_id=batch_id)
+                    errors += 1
+                    handled_task_ids.add(task_id)
+                    print(f"  {task_id}: result type={result_type}")
+            break
+        except Exception as e:
+            is_stream_drop = isinstance(e, httpx.RemoteProtocolError) or "incomplete chunked read" in str(e).lower()
+            if is_stream_drop and stream_attempt < max_stream_retries:
+                stream_attempt += 1
+                wait_s = min(5 * stream_attempt, 30)
+                print(
+                    f"Batch result stream interrupted ({e}); retry {stream_attempt}/{max_stream_retries} in {wait_s}s..."
+                )
+                time.sleep(wait_s)
                 continue
-            raw_text = _extract_text_from_batch_message(msg)
-            try:
-                cleaned = extract_json_payload(raw_text)
-                raw_result = json.loads(cleaned)
-            except (json.JSONDecodeError, ValueError) as e:
-                mark_agent2_error(con, task_id, batch_id=batch_id)
-                errors += 1
-                print(f"  {task_id}: parse error {e}")
-                print("    ---- CLAUDE BATCH RAW TEXT BEGIN ----")
-                print(raw_text)
-                print("    ---- CLAUDE BATCH RAW TEXT END ----")
-                print("    ---- CLAUDE BATCH CLEANED JSON BEGIN ----")
-                print(cleaned)
-                print("    ---- CLAUDE BATCH CLEANED JSON END ----")
-                continue
-            row = con.execute("""
-                SELECT TaskId, Document_title, PromptVersion, EmbeddingModel
-                FROM my_db.mdr_reconciliation.MdrReconciliationTasks
-                WHERE TaskId = ?
-            """, [task_id]).fetchone()
-            if not row:
-                errors += 1
-                continue
-            task = {"TaskId": row[0], "Document_title": row[1], "PromptVersion": row[2], "EmbeddingModel": row[3]}
-            candidates = fetch_candidates_for_task(con, task["Document_title"], task["PromptVersion"], task["EmbeddingModel"])
-            if not candidates:
-                mark_agent2_error(con, task_id, batch_id=batch_id)
-                errors += 1
-                continue
-            try:
-                validated = validate_agent_output(raw_result, candidates)
-                save_agent2_evaluation(con=con, task=task, model=model, result=validated)
-                saved += 1
-                print(f"  {task_id} -> {validated['DecisionType']} (saved)")
-            except Exception as e:
-                mark_agent2_error(con, task_id, batch_id=batch_id)
-                errors += 1
-                print(f"  {task_id}: validation/save error {e}")
-        else:
-            mark_agent2_error(con, task_id, batch_id=batch_id)
-            errors += 1
-            print(f"  {task_id}: result type={result_type}")
+            raise
     print(f"Batch collect done: {saved} saved, {errors} errors.")
 
 
@@ -860,8 +969,16 @@ def main():
     ap.add_argument("--workers", type=int, default=4, help="Number of parallel workers (default: 4).")
     ap.add_argument("--model", default=None, help="Anthropic model for agent (default: claude-sonnet-4-6).")
     ap.add_argument("--batch", action="store_true", help="Use Batch API: submit pending tasks and exit (no rate limit; collect later with --batch-collect).")
-    ap.add_argument("--batch-collect", action="store_true", help="Poll batch until ended and write results to DB. Use --batch-id or last batch from .agent2_last_batch_id.")
-    ap.add_argument("--batch-id", default=None, help="Batch ID for --batch-collect (default: read from .agent2_last_batch_id).")
+    ap.add_argument("--batch-collect", action="store_true", help="Poll and collect all batch ids saved by latest submit in .agent2_last_batch_ids.json.")
+    ap.add_argument(
+        "--batch-max-bytes",
+        type=int,
+        default=DEFAULT_BATCH_TARGET_BYTES,
+        help=(
+            "Target max serialized bytes per submitted Claude batch chunk "
+            f"(default: {DEFAULT_BATCH_TARGET_BYTES}, hard max: {CLAUDE_BATCH_REQUEST_HARD_LIMIT_BYTES})."
+        ),
+    )
     ap.add_argument("--test-fixed-tasks", action="store_true", help="Test mode: use a shared fixed list of TaskId stored in .recon_test_tasks.json.")
     ap.add_argument("--test-task-count", type=int, default=150, help="Number of random TaskId to pick when creating the shared test list (default: 150).")
     args = ap.parse_args()
@@ -875,13 +992,27 @@ def main():
     ensure_agent_top_candidates_table(con)
 
     if args.batch_collect:
-        batch_id = (args.batch_id or "").strip() or (BATCH_ID_FILE.read_text(encoding="utf-8").strip() if BATCH_ID_FILE.exists() else "")
-        if not batch_id:
-            print("Error: no --batch-id and no .agent2_last_batch_id file.")
+        if not BATCH_IDS_FILE.exists():
+            print("Error: no .agent2_last_batch_ids.json file. Run --batch first.")
             con.close()
             return
-        print(f"Collecting results for batch: {batch_id}")
-        run_batch_collect(con=con, batch_id=batch_id, model=args.model)
+        try:
+            batch_ids = json.loads(BATCH_IDS_FILE.read_text(encoding="utf-8"))
+            if not isinstance(batch_ids, list):
+                raise ValueError("invalid JSON shape")
+            batch_ids = [str(x).strip() for x in batch_ids if str(x).strip()]
+        except Exception as e:
+            print(f"Error reading {BATCH_IDS_FILE.name}: {e}")
+            con.close()
+            return
+        if not batch_ids:
+            print("No batch ids to collect.")
+            con.close()
+            return
+        print(f"Collecting {len(batch_ids)} batch(es) from {BATCH_IDS_FILE.name}...")
+        for i, batch_id in enumerate(batch_ids, start=1):
+            print(f"[{i}/{len(batch_ids)}] Collecting results for batch: {batch_id}")
+            run_batch_collect(con=con, batch_id=batch_id, model=args.model)
         con.close()
         return
 
@@ -898,10 +1029,21 @@ def main():
             print("No pending tasks for batch.")
             con.close()
             return
-        batch_id = run_batch_submit(con=con, tasks=tasks, model=args.model)
+        batch_ids = run_batch_submit_chunked(
+            con=con,
+            tasks=tasks,
+            model=args.model,
+            target_max_bytes=args.batch_max_bytes,
+        )
         con.close()
-        print(f"Batch submitted: {batch_id}")
-        print("Run with --batch-collect later to write results to DB (or use --batch-id if you save it).")
+        if len(batch_ids) == 1:
+            print(f"Batch submitted: {batch_ids[0]}")
+        else:
+            print(
+                f"Batches submitted: {len(batch_ids)} (last={batch_ids[-1]}). "
+                "Use --batch-collect to collect all results."
+            )
+        print("Run with --batch-collect later to write results to DB.")
         return
 
     tasks = fetch_pending_tasks(

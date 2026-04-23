@@ -13,7 +13,7 @@ Logica:
 Config: config.txt (MOTHERDUCK_*, PROMPT_VERSION, VERTEX_*). Vedi config.example.txt.
 
 Uso in tempo reale: python 3.3_run_judge.py [--prompt-version v1] [--embedding-model ...] [--limit N] [--workers 4] [--model ...]
-Uso batch (solo task in conflitto): python 3.3_run_judge.py --batch [--limit N] poi --batch-collect
+Uso batch (solo task in conflitto): python 3.3_run_judge.py --batch [--limit N] [--batch-max-bytes 800000000] poi --batch-collect
 """
 
 import json
@@ -24,6 +24,7 @@ import tempfile
 import time
 import random
 import re
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -42,9 +43,11 @@ except ImportError:
 # Config da file (stesso formato degli altri script)
 # -----------------------------
 CONFIG_PATH = Path(__file__).resolve().parent / "config.txt"
-BATCH_ID_FILE = Path(__file__).resolve().parent / ".judge_last_batch_id"
 BATCH_INFO_FILE = Path(__file__).resolve().parent / ".judge_last_batch_info.json"
+BATCH_INFOS_FILE = Path(__file__).resolve().parent / ".judge_last_batch_infos.json"
 TEST_TASK_FILE = Path(__file__).resolve().parent / ".recon_test_tasks.json"
+VERTEX_BATCH_INPUT_FILE_HARD_LIMIT_BYTES = 1_000_000_000
+DEFAULT_BATCH_TARGET_BYTES = 800_000_000
 
 
 def load_config(path: Optional[Path] = None) -> Dict[str, str]:
@@ -1156,11 +1159,34 @@ def run_batch_submit(
     tasks: List[Dict[str, Any]],
     model: str,
     output_prompt_version: Optional[str] = None,
-) -> str:
+) -> List[Dict[str, Any]]:
     """
-    Classify each task: consensus -> write_final_result immediately; conflict -> add to batch.
-    Returns job name if batch was created; empty string if all consensus (no batch).
+    Classify each task: consensus -> write_final_result immediately; conflict -> add to chunked Vertex jobs.
+    Returns list of batch infos (empty if all consensus/no conflicts).
     """
+    return run_batch_submit_chunked(
+        con=con,
+        tasks=tasks,
+        model=model,
+        output_prompt_version=output_prompt_version,
+        target_max_bytes=DEFAULT_BATCH_TARGET_BYTES,
+    )
+
+
+def run_batch_submit_chunked(
+    con: duckdb.DuckDBPyConnection,
+    tasks: List[Dict[str, Any]],
+    model: str,
+    output_prompt_version: Optional[str],
+    target_max_bytes: int,
+) -> List[Dict[str, Any]]:
+    if target_max_bytes <= 0:
+        raise ValueError("target_max_bytes must be > 0")
+    if target_max_bytes > VERTEX_BATCH_INPUT_FILE_HARD_LIMIT_BYTES:
+        raise ValueError(
+            f"target_max_bytes cannot exceed hard limit {VERTEX_BATCH_INPUT_FILE_HARD_LIMIT_BYTES}"
+        )
+
     bucket = _cfg("VERTEX_BATCH_GCS_BUCKET")
     if not bucket:
         raise RuntimeError("Per il batch Vertex serve VERTEX_BATCH_GCS_BUCKET in config.txt")
@@ -1168,11 +1194,63 @@ def run_batch_submit(
     if prefix:
         prefix = prefix + "/"
     project_id = _cfg("VERTEX_PROJECT_ID")
-    run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    run_id_base = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
     consensus_count = 0
-    lines: List[str] = []
-    conflict_tasks: List[Dict[str, str]] = []  # [{"task_id": ..., "resolution_mode": ...}, ...]
+    current_lines: List[str] = []
+    current_conflict_tasks: List[Dict[str, str]] = []
+    current_bytes = 0
+    submitted_infos: List[Dict[str, Any]] = []
+    total_conflicts = 0
+    total_bytes = 0
+    skipped_too_large = 0
+
+    def flush_chunk(chunk_index: int) -> None:
+        nonlocal current_lines, current_conflict_tasks, current_bytes
+        if not current_lines:
+            return
+        run_id = f"{run_id_base}_{chunk_index:03d}"
+        input_blob = f"{prefix}in/judge_{run_id}.jsonl"
+        gcs_input_uri = f"gs://{bucket}/{input_blob}"
+        output_prefix = f"{prefix}out/run_{run_id}/"
+        gcs_output_uri = f"gs://{bucket}/{output_prefix}"
+        _gcs_upload_jsonl(bucket, input_blob, current_lines, project_id)
+        job = _genai_client.batches.create(
+            model=model,
+            src=gcs_input_uri,
+            config=CreateBatchJobConfig(dest=gcs_output_uri),
+        )
+        job_name = getattr(job, "name", None) or (job.get("name") if isinstance(job, dict) else "")
+        batch_id_short = job_name.split("/")[-1] if job_name and "/" in job_name else (job_name or run_id)
+        submitted_task_ids = [ct["task_id"] for ct in current_conflict_tasks]
+        ts = now_ts_naive_utc()
+        status_submitted = f"submitted_{batch_id_short}"
+        for task_id in submitted_task_ids:
+            con.execute(f"""
+                UPDATE {TASKS_TABLE}
+                SET JudgeStatus = ?,
+                    FinalStatus = CASE WHEN FinalStatus = 'ready_for_judge' THEN 'in_progress' ELSE FinalStatus END,
+                    UpdatedAt = ?
+                WHERE TaskId = ?
+            """, [status_submitted, ts, task_id])
+        info = {
+            "job_name": job_name,
+            "output_prefix": gcs_output_uri,
+            "input_blob": input_blob,
+            "task_ids": submitted_task_ids,
+            "conflict_tasks": current_conflict_tasks,
+        }
+        submitted_infos.append(info)
+        # Persist after each submitted chunk so partial progress is recoverable on later failures.
+        BATCH_INFOS_FILE.write_text(json.dumps(submitted_infos, indent=2), encoding="utf-8")
+        BATCH_INFO_FILE.write_text(json.dumps(submitted_infos[-1], indent=2), encoding="utf-8")
+        print(
+            f"Submitted chunk {len(submitted_infos)}: job={job_name}, "
+            f"tasks={len(submitted_task_ids)}, jsonl_bytes={current_bytes}"
+        )
+        current_lines = []
+        current_conflict_tasks = []
+        current_bytes = 0
 
     for task in tasks:
         agent1 = load_agent_decision(con, task["TaskId"], AGENT1_NAME)
@@ -1212,57 +1290,46 @@ def run_batch_submit(
         user_prompt_with_id = f"TASK_ID: {task['TaskId']}\n{user_prompt}"
         full_prompt = f"{SYSTEM_PROMPT.strip()}\n\nUSER INPUT:\n{user_prompt_with_id}"
         line_obj = _vertex_batch_request_line(full_prompt)
-        lines.append(json.dumps(line_obj))
-        conflict_tasks.append({"task_id": task["TaskId"], "resolution_mode": resolution_mode})
+        line = json.dumps(line_obj)
+        line_bytes = len((line + "\n").encode("utf-8"))
+        if line_bytes > target_max_bytes:
+            mark_judge_error(con, task["TaskId"])
+            skipped_too_large += 1
+            print(
+                f"  {task['TaskId']}: skipped (single request {line_bytes} bytes exceeds target {target_max_bytes})"
+            )
+            continue
+        if current_lines and (current_bytes + line_bytes > target_max_bytes):
+            flush_chunk(len(submitted_infos) + 1)
+        current_lines.append(line)
+        current_conflict_tasks.append({"task_id": task["TaskId"], "resolution_mode": resolution_mode})
+        current_bytes += line_bytes
+        total_conflicts += 1
+        total_bytes += line_bytes
 
     if consensus_count:
         print(f"Resolved by consensus (no Gemini): {consensus_count} task(s).")
-    if not lines:
+    flush_chunk(len(submitted_infos) + 1)
+    if not submitted_infos:
         if consensus_count == len(tasks):
             print("All tasks resolved by consensus; no batch created.")
         else:
             print("No conflict tasks to submit (or missing data).")
-        return ""
+        return []
 
-    input_blob = f"{prefix}in/judge_{run_id}.jsonl"
-    gcs_input_uri = f"gs://{bucket}/{input_blob}"
-    output_prefix = f"{prefix}out/run_{run_id}/"
-    gcs_output_uri = f"gs://{bucket}/{output_prefix}"
-
-    _gcs_upload_jsonl(bucket, input_blob, lines, project_id)
-
-    job = _genai_client.batches.create(
-        model=model,
-        src=gcs_input_uri,
-        config=CreateBatchJobConfig(dest=gcs_output_uri),
+    avg_bytes = total_bytes / max(total_conflicts, 1)
+    estimated_tasks_per_batch = max(1, int(target_max_bytes // max(avg_bytes, 1)))
+    estimated_batch_count = math.ceil(total_conflicts / estimated_tasks_per_batch)
+    print(
+        "Batch sizing summary: "
+        f"conflict_tasks={total_conflicts}, avg_request_bytes={avg_bytes:.0f}, "
+        f"target_max_bytes={target_max_bytes}, estimated_tasks_per_batch={estimated_tasks_per_batch}, "
+        f"estimated_batches={estimated_batch_count}, submitted_batches={len(submitted_infos)}, "
+        f"skipped_too_large={skipped_too_large}"
     )
-    job_name = getattr(job, "name", None) or (job.get("name") if isinstance(job, dict) else "")
-    batch_id_short = job_name.split("/")[-1] if job_name and "/" in job_name else (job_name or run_id)
-
-    submitted_task_ids = [ct["task_id"] for ct in conflict_tasks]
-    ts = now_ts_naive_utc()
-    status_submitted = f"submitted_{batch_id_short}"
-    for task_id in submitted_task_ids:
-        con.execute(f"""
-            UPDATE {TASKS_TABLE}
-            SET JudgeStatus = ?,
-                FinalStatus = CASE WHEN FinalStatus = 'ready_for_judge' THEN 'in_progress' ELSE FinalStatus END,
-                UpdatedAt = ?
-            WHERE TaskId = ?
-        """, [status_submitted, ts, task_id])
-
-    BATCH_ID_FILE.write_text(job_name, encoding="utf-8")
-    BATCH_INFO_FILE.write_text(
-        json.dumps({
-            "job_name": job_name,
-            "output_prefix": gcs_output_uri,
-            "input_blob": input_blob,
-            "task_ids": submitted_task_ids,
-            "conflict_tasks": conflict_tasks,
-        }, indent=2),
-        encoding="utf-8",
-    )
-    return job_name
+    BATCH_INFOS_FILE.write_text(json.dumps(submitted_infos, indent=2), encoding="utf-8")
+    BATCH_INFO_FILE.write_text(json.dumps(submitted_infos[-1], indent=2), encoding="utf-8")
+    return submitted_infos
 
 
 def _parse_gcs_uri(gcs_uri: str) -> tuple:
@@ -1278,22 +1345,24 @@ def _parse_gcs_uri(gcs_uri: str) -> tuple:
 
 def run_batch_collect(
     con: duckdb.DuckDBPyConnection,
-    batch_id: str,
     model: str,
     output_prompt_version: Optional[str] = None,
     poll_interval: int = 60,
+    batch_info: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Poll Vertex batch job until completed, download output from GCS, write results to DB."""
-    if not BATCH_INFO_FILE.exists():
-        print("Error: .judge_last_batch_info.json non trovato (necessario per output_prefix e task_ids).")
-        return
-    info = json.loads(BATCH_INFO_FILE.read_text(encoding="utf-8"))
-    job_name = (batch_id or "").strip() or info.get("job_name") or ""
+    info = batch_info
+    if info is None:
+        if not BATCH_INFO_FILE.exists():
+            print("Error: .judge_last_batch_info.json non trovato (necessario per output_prefix e task_ids).")
+            return
+        info = json.loads(BATCH_INFO_FILE.read_text(encoding="utf-8"))
+    job_name = (info.get("job_name") or "").strip()
     output_prefix_uri = info.get("output_prefix") or ""
     input_blob = info.get("input_blob")  # optional, for cleanup (older runs may not have it)
     task_ids = info.get("task_ids") or []
     if not job_name:
-        print("Error: job_name non disponibile (--batch-id o .judge_last_batch_info.json).")
+        print("Error: job_name non disponibile nel batch info.")
         return
     if not output_prefix_uri or not task_ids:
         print("Error: output_prefix o task_ids mancanti in .judge_last_batch_info.json.")
@@ -1512,8 +1581,16 @@ def main():
     ap.add_argument("--output-prompt-version", default=None, help="PromptVersion to write in output (default: same as --prompt-version). Set in config as JUDGE_OUTPUT_PROMPT_VERSION.")
     ap.add_argument("--model", default=None, help="Vertex AI / Gemini model for judge (default: gemini-2.5-pro).")
     ap.add_argument("--batch", action="store_true", help="Use Batch API: submit ready tasks and exit (collect later with --batch-collect).")
-    ap.add_argument("--batch-collect", action="store_true", help="Poll batch until completed and write results to DB. Use --batch-id or .judge_last_batch_id.")
-    ap.add_argument("--batch-id", default=None, help="Batch ID for --batch-collect (default: read from .judge_last_batch_id).")
+    ap.add_argument("--batch-collect", action="store_true", help="Poll and collect all batch ids saved by latest submit in .judge_last_batch_infos.json.")
+    ap.add_argument(
+        "--batch-max-bytes",
+        type=int,
+        default=DEFAULT_BATCH_TARGET_BYTES,
+        help=(
+            "Target max JSONL bytes per submitted Vertex batch chunk "
+            f"(default: {DEFAULT_BATCH_TARGET_BYTES}, hard max: {VERTEX_BATCH_INPUT_FILE_HARD_LIMIT_BYTES})."
+        ),
+    )
     ap.add_argument("--test-fixed-tasks", action="store_true", help="Test mode: use a shared fixed list of TaskId stored in .recon_test_tasks.json.")
     ap.add_argument("--test-task-count", type=int, default=150, help="Number of random TaskId to pick when creating the shared test list (default: 150).")
     args = ap.parse_args()
@@ -1528,18 +1605,33 @@ def main():
     ensure_agent_top_candidates_table(con)
 
     if args.batch_collect:
-        job_name = (args.batch_id or "").strip() or (BATCH_ID_FILE.read_text(encoding="utf-8").strip() if BATCH_ID_FILE.exists() else "")
-        if not job_name:
-            print("Error: no --batch-id and no .judge_last_batch_id file.")
+        if not BATCH_INFOS_FILE.exists():
+            print("Error: no .judge_last_batch_infos.json file. Run --batch first.")
             con.close()
             return
-        print(f"Collecting results for batch: {job_name}")
-        run_batch_collect(
-            con=con,
-            batch_id=job_name,
-            model=args.model,
-            output_prompt_version=args.output_prompt_version,
-        )
+        try:
+            batch_infos = json.loads(BATCH_INFOS_FILE.read_text(encoding="utf-8"))
+            if not isinstance(batch_infos, list):
+                raise ValueError("invalid JSON shape")
+            batch_infos = [x for x in batch_infos if isinstance(x, dict) and (x.get("job_name") or "").strip()]
+        except Exception as e:
+            print(f"Error reading {BATCH_INFOS_FILE.name}: {e}")
+            con.close()
+            return
+        if not batch_infos:
+            print("No batch infos to collect.")
+            con.close()
+            return
+        print(f"Collecting {len(batch_infos)} batch(es) from {BATCH_INFOS_FILE.name}...")
+        for i, info in enumerate(batch_infos, start=1):
+            job_name = str(info.get("job_name", "")).strip()
+            print(f"[{i}/{len(batch_infos)}] Collecting results for batch: {job_name}")
+            run_batch_collect(
+                con=con,
+                model=args.model,
+                output_prompt_version=args.output_prompt_version,
+                batch_info=info,
+            )
         con.close()
         return
 
@@ -1556,13 +1648,23 @@ def main():
             return
         if args.test_fixed_tasks:
             tasks = load_or_create_test_tasks(tasks, args.test_task_count)
-        job_name = run_batch_submit(
-            con=con, tasks=tasks, model=args.model, output_prompt_version=args.output_prompt_version
+        batch_infos = run_batch_submit_chunked(
+            con=con,
+            tasks=tasks,
+            model=args.model,
+            output_prompt_version=args.output_prompt_version,
+            target_max_bytes=args.batch_max_bytes,
         )
         con.close()
-        if job_name:
-            print(f"Batch submitted: {job_name}")
-            print("Run with --batch-collect later to write results to DB (usa .judge_last_batch_info.json).")
+        if batch_infos:
+            if len(batch_infos) == 1:
+                print(f"Batch submitted: {batch_infos[0].get('job_name')}")
+            else:
+                print(
+                    f"Batches submitted: {len(batch_infos)} (last={batch_infos[-1].get('job_name')}). "
+                    "Use --batch-collect to collect all results."
+                )
+            print("Run with --batch-collect later to write results to DB.")
         return
 
     tasks = fetch_ready_tasks(

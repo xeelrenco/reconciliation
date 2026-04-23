@@ -13,3 +13,5 @@ __pycache__/
 .recovery_last_batch_meta.json
 ~$renco_riconciliazione_report_with_top3_and_recovery.xlsx
 renco_riconciliazione_report_with_top3_and_recovery.xlsx
+.agent1_last_batch_ids.json
+.agent2_last_batch_ids.json
