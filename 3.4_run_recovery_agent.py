@@ -54,6 +54,11 @@ BATCH_METAS_FILE = Path(__file__).resolve().parent / ".recovery_last_batch_metas
 BATCH_ENDPOINT = "/v1/responses"
 OPENAI_BATCH_INPUT_FILE_HARD_LIMIT_BYTES = 209_715_200
 DEFAULT_BATCH_TARGET_BYTES = 180_000_000
+DEFAULT_ADAPTIVE_BATCH_INITIAL_LIMIT = 1200
+DEFAULT_ADAPTIVE_BATCH_MIN_LIMIT = 100
+DEFAULT_ADAPTIVE_BATCH_MAX_LIMIT = 5000
+DEFAULT_ADAPTIVE_BATCH_BACKOFF_FACTOR = 0.5
+DEFAULT_ADAPTIVE_BATCH_GROWTH_FACTOR = 1.25
 
 
 def load_config(path: Optional[Path] = None) -> Dict[str, str]:
@@ -1162,6 +1167,28 @@ def save_recovery_result(
         raise
 
 
+def recovery_result_exists(
+    con: duckdb.DuckDBPyConnection,
+    task_id: str,
+    prompt_version: str,
+    embedding_model: str,
+    stage: str,
+) -> bool:
+    row = con.execute(
+        f"""
+        SELECT 1
+        FROM {RECOVERY_RESULTS_TABLE}
+        WHERE TaskId = ?
+          AND PromptVersion = ?
+          AND EmbeddingModel = ?
+          AND RecoveryStage = ?
+        LIMIT 1
+        """,
+        [task_id, prompt_version, embedding_model, stage],
+    ).fetchone()
+    return bool(row)
+
+
 def process_one_task(
     con: duckdb.DuckDBPyConnection,
     task: Dict[str, Any],
@@ -1424,7 +1451,8 @@ def run_batch_collect(
     model: str,
     fallback_top_n: int,
     poll_interval: int = 60,
-) -> None:
+    skip_existing: bool = False,
+) -> Dict[str, Any]:
     while True:
         batch = client.batches.retrieve(batch_id)
         status = getattr(batch, "status", None) or (batch.get("status") if isinstance(batch, dict) else None)
@@ -1432,12 +1460,13 @@ def run_batch_collect(
             break
         if status in ("failed", "canceled", "expired"):
             print(f"Batch {batch_id} ended with status={status}. Cannot collect results.")
-            return
+            return {"batch_id": batch_id, "status": str(status), "saved": 0, "errors": 0, "skipped_existing": 0}
         print(f"Batch {batch_id} status={status}, waiting {poll_interval}s...")
         time.sleep(poll_interval)
 
     saved = 0
     errors = 0
+    skipped_existing = 0
     output_file_id = getattr(batch, "output_file_id", None) or (batch.get("output_file_id") if isinstance(batch, dict) else None)
     error_file_id = getattr(batch, "error_file_id", None) or (batch.get("error_file_id") if isinstance(batch, dict) else None)
 
@@ -1487,6 +1516,16 @@ def run_batch_collect(
                 if not task:
                     errors += 1
                     print(f"  {identity['TaskId']}: task not found in DB")
+                    continue
+                stage = recovery_stage_for_final_decision(task["FinalDecisionType"])
+                if skip_existing and recovery_result_exists(
+                    con=con,
+                    task_id=task["TaskId"],
+                    prompt_version=task["PromptVersion"],
+                    embedding_model=task["EmbeddingModel"],
+                    stage=stage,
+                ):
+                    skipped_existing += 1
                     continue
 
                 prepared = prepare_recovery_inputs(con, task, fallback_top_n)
@@ -1550,7 +1589,129 @@ def run_batch_collect(
         con.execute("ROLLBACK;")
         raise
 
-    print(f"Batch collect done: {saved} saved, {errors} errors.")
+    print(f"Batch collect done: {saved} saved, {errors} errors, {skipped_existing} skipped_existing.")
+    return {
+        "batch_id": batch_id,
+        "status": "completed",
+        "saved": saved,
+        "errors": errors,
+        "skipped_existing": skipped_existing,
+    }
+
+
+def run_batch_and_collect_adaptive(
+    con: duckdb.DuckDBPyConnection,
+    mode: str,
+    prompt_version: str,
+    embedding_model: Optional[str],
+    model: str,
+    fallback_top_n: int,
+    rerun_existing: bool,
+    target_max_bytes: int,
+    initial_limit: int,
+    min_limit: int,
+    max_limit: int,
+    backoff_factor: float,
+    growth_factor: float,
+    poll_interval: int,
+    skip_existing: bool,
+    max_rounds: Optional[int],
+) -> None:
+    current_limit = max(min_limit, min(max_limit, int(initial_limit)))
+    rounds = 0
+
+    while True:
+        if max_rounds is not None and rounds >= max_rounds:
+            print(f"Stopping: reached max rounds ({max_rounds}).")
+            return
+
+        tasks = fetch_tasks(
+            con=con,
+            mode=mode,
+            prompt_version=prompt_version,
+            embedding_model=embedding_model,
+            limit=current_limit,
+            rerun_existing=rerun_existing,
+        )
+        if not tasks:
+            print("No tasks found for adaptive batch-and-collect. Done.")
+            return
+
+        rounds += 1
+        print(
+            f"[Adaptive round {rounds}] submitting {len(tasks)} task(s) "
+            f"(current_limit={current_limit}, min={min_limit}, max={max_limit})"
+        )
+        try:
+            batch_info = run_batch_submit_chunked(
+                con=con,
+                tasks=tasks,
+                model=model,
+                fallback_top_n=fallback_top_n,
+                mode=mode,
+                prompt_version=prompt_version,
+                embedding_model=embedding_model,
+                rerun_existing=rerun_existing,
+                target_max_bytes=target_max_bytes,
+            )
+        except Exception as e:
+            next_limit = max(min_limit, int(max(1, current_limit) * float(backoff_factor)))
+            if next_limit == current_limit and current_limit > min_limit:
+                next_limit = current_limit - 1
+            current_limit = max(min_limit, next_limit)
+            print(
+                f"[Adaptive round {rounds}] submit failed ({e}). "
+                f"Reducing limit to {current_limit} and retrying."
+            )
+            continue
+
+        batch_ids = list(batch_info.get("batch_ids") or [])
+        if batch_info.get("saved_without_batch"):
+            print(
+                f"[Adaptive round {rounds}] saved_without_batch={batch_info['saved_without_batch']} "
+                "(empty merged pool)."
+            )
+        if not batch_ids:
+            print(f"[Adaptive round {rounds}] no batch created; moving to next round.")
+            continue
+
+        all_completed = True
+        for i, batch_id in enumerate(batch_ids, start=1):
+            print(f"[Adaptive round {rounds}] collecting batch {i}/{len(batch_ids)}: {batch_id}")
+            collect_model = model
+            try:
+                collect_result = run_batch_collect(
+                    con=con,
+                    batch_id=batch_id,
+                    model=collect_model,
+                    fallback_top_n=fallback_top_n,
+                    poll_interval=max(1, int(poll_interval or 60)),
+                    skip_existing=skip_existing,
+                )
+            except Exception as e:
+                print(f"[Adaptive round {rounds}] collect exception for {batch_id}: {e}")
+                all_completed = False
+                break
+            if collect_result["status"] != "completed":
+                print(
+                    f"[Adaptive round {rounds}] batch {batch_id} not completed "
+                    f"({collect_result['status']})."
+                )
+                all_completed = False
+                break
+
+        if all_completed:
+            next_limit = min(max_limit, int(max(1, current_limit) * float(growth_factor)))
+            if next_limit == current_limit and current_limit < max_limit:
+                next_limit = current_limit + 1
+            current_limit = min(max_limit, next_limit)
+            print(f"[Adaptive round {rounds}] completed successfully. Next limit: {current_limit}")
+        else:
+            next_limit = max(min_limit, int(max(1, current_limit) * float(backoff_factor)))
+            if next_limit == current_limit and current_limit > min_limit:
+                next_limit = current_limit - 1
+            current_limit = max(min_limit, next_limit)
+            print(f"[Adaptive round {rounds}] backoff after failed round. Next limit: {current_limit}")
 
 
 def _increment_stats(
@@ -1683,6 +1844,19 @@ def main():
         help="Poll and collect all batch ids saved by latest submit in .recovery_last_batch_metas.json.",
     )
     ap.add_argument(
+        "--batch-and-collect",
+        action="store_true",
+        help=(
+            "Adaptive loop: submit one tranche, collect immediately, and continue automatically. "
+            "On failed round, retries with lower tranche size."
+        ),
+    )
+    ap.add_argument(
+        "--batch-collect-skip-existing",
+        action="store_true",
+        help="When used with --batch-collect or --batch-and-collect, skip tasks that already have a recovery result.",
+    )
+    ap.add_argument(
         "--batch-max-bytes",
         type=int,
         default=DEFAULT_BATCH_TARGET_BYTES,
@@ -1697,10 +1871,56 @@ def main():
         default=60,
         help="Polling interval in seconds for --batch-collect.",
     )
+    ap.add_argument(
+        "--batch-initial-limit",
+        type=int,
+        default=DEFAULT_ADAPTIVE_BATCH_INITIAL_LIMIT,
+        help=f"Initial tranche size for --batch-and-collect (default: {DEFAULT_ADAPTIVE_BATCH_INITIAL_LIMIT}).",
+    )
+    ap.add_argument(
+        "--batch-min-limit",
+        type=int,
+        default=DEFAULT_ADAPTIVE_BATCH_MIN_LIMIT,
+        help=f"Minimum tranche size for --batch-and-collect backoff (default: {DEFAULT_ADAPTIVE_BATCH_MIN_LIMIT}).",
+    )
+    ap.add_argument(
+        "--batch-max-limit",
+        type=int,
+        default=DEFAULT_ADAPTIVE_BATCH_MAX_LIMIT,
+        help=f"Maximum tranche size for --batch-and-collect growth (default: {DEFAULT_ADAPTIVE_BATCH_MAX_LIMIT}).",
+    )
+    ap.add_argument(
+        "--batch-backoff-factor",
+        type=float,
+        default=DEFAULT_ADAPTIVE_BATCH_BACKOFF_FACTOR,
+        help=f"Backoff multiplier after failed round in --batch-and-collect (default: {DEFAULT_ADAPTIVE_BATCH_BACKOFF_FACTOR}).",
+    )
+    ap.add_argument(
+        "--batch-growth-factor",
+        type=float,
+        default=DEFAULT_ADAPTIVE_BATCH_GROWTH_FACTOR,
+        help=f"Growth multiplier after successful round in --batch-and-collect (default: {DEFAULT_ADAPTIVE_BATCH_GROWTH_FACTOR}).",
+    )
+    ap.add_argument(
+        "--batch-max-rounds",
+        type=int,
+        default=None,
+        help="Optional max adaptive rounds for --batch-and-collect (default: no limit).",
+    )
     args = ap.parse_args()
 
+    if args.batch_and_collect and (args.batch or args.batch_collect):
+        raise RuntimeError("Use --batch-and-collect alone (do not combine with --batch or --batch-collect).")
     if args.batch and args.batch_collect:
         raise RuntimeError("Use either --batch or --batch-collect, not both.")
+    if args.batch_and_collect and args.batch_min_limit <= 0:
+        raise RuntimeError("--batch-min-limit must be > 0.")
+    if args.batch_and_collect and args.batch_max_limit < args.batch_min_limit:
+        raise RuntimeError("--batch-max-limit must be >= --batch-min-limit.")
+    if args.batch_and_collect and not (0 < args.batch_backoff_factor <= 1):
+        raise RuntimeError("--batch-backoff-factor must be in (0, 1].")
+    if args.batch_and_collect and args.batch_growth_factor < 1:
+        raise RuntimeError("--batch-growth-factor must be >= 1.")
 
     prompt_version = args.prompt_version or _cfg("PROMPT_VERSION")
     if not prompt_version:
@@ -1728,6 +1948,7 @@ def main():
                     model=collect_model,
                     fallback_top_n=collect_fallback_top_n,
                     poll_interval=max(1, int(args.poll_interval or 60)),
+                    skip_existing=args.batch_collect_skip_existing,
                 )
         finally:
             con.close()
@@ -1736,6 +1957,26 @@ def main():
     con = connect_motherduck()
     try:
         ensure_recovery_results_table(con)
+        if args.batch_and_collect:
+            run_batch_and_collect_adaptive(
+                con=con,
+                mode=args.mode,
+                prompt_version=prompt_version,
+                embedding_model=args.embedding_model,
+                model=model,
+                fallback_top_n=args.fallback_top_n,
+                rerun_existing=args.rerun_existing,
+                target_max_bytes=args.batch_max_bytes,
+                initial_limit=args.batch_initial_limit,
+                min_limit=args.batch_min_limit,
+                max_limit=args.batch_max_limit,
+                backoff_factor=args.batch_backoff_factor,
+                growth_factor=args.batch_growth_factor,
+                poll_interval=max(1, int(args.poll_interval or 60)),
+                skip_existing=args.batch_collect_skip_existing,
+                max_rounds=args.batch_max_rounds,
+            )
+            return
         tasks = fetch_tasks(
             con=con,
             mode=args.mode,

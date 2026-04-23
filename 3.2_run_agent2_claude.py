@@ -30,7 +30,7 @@ import random
 import math
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import duckdb
 import anthropic
@@ -44,6 +44,11 @@ BATCH_IDS_FILE = Path(__file__).resolve().parent / ".agent2_last_batch_ids.json"
 TEST_TASK_FILE = Path(__file__).resolve().parent / ".recon_test_tasks.json"
 CLAUDE_BATCH_REQUEST_HARD_LIMIT_BYTES = 256_000_000
 DEFAULT_BATCH_TARGET_BYTES = 240_000_000
+DEFAULT_ADAPTIVE_BATCH_INITIAL_LIMIT = 7000
+DEFAULT_ADAPTIVE_BATCH_MIN_LIMIT = 500
+DEFAULT_ADAPTIVE_BATCH_MAX_LIMIT = 12000
+DEFAULT_ADAPTIVE_BATCH_BACKOFF_FACTOR = 0.5
+DEFAULT_ADAPTIVE_BATCH_GROWTH_FACTOR = 1.1
 
 
 def load_config(path: Optional[Path] = None) -> Dict[str, str]:
@@ -550,11 +555,13 @@ def save_agent2_evaluation(
     con: duckdb.DuckDBPyConnection,
     task: Dict[str, Any],
     model: str,
-    result: Dict[str, Any]
+    result: Dict[str, Any],
+    manage_transaction: bool = True,
 ) -> None:
     ts = now_ts_naive_utc()
 
-    con.execute("BEGIN;")
+    if manage_transaction:
+        con.execute("BEGIN;")
     try:
         con.execute("""
             INSERT INTO my_db.mdr_reconciliation.MdrReconciliationAgentDecisions
@@ -623,9 +630,11 @@ def save_agent2_evaluation(
             WHERE TaskId = ?
         """, [ts, task["TaskId"]])
 
-        con.execute("COMMIT;")
+        if manage_transaction:
+            con.execute("COMMIT;")
     except Exception:
-        con.execute("ROLLBACK;")
+        if manage_transaction:
+            con.execute("ROLLBACK;")
         raise
 
 def mark_agent2_error(
@@ -644,6 +653,45 @@ def mark_agent2_error(
           UpdatedAt = ?
         WHERE TaskId = ?
     """, [status, ts, task_id])
+
+
+def reset_agent2_batch_statuses_to_pending(
+    con: duckdb.DuckDBPyConnection,
+    batch_id: str,
+) -> int:
+    """
+    Reset submitted/in_batch/error statuses for one failed batch back to pending,
+    only for tasks that do not already have an Agent2 decision saved.
+    """
+    ts = now_ts_naive_utc()
+    status_submitted = f"submitted_{batch_id}"
+    status_in_batch = f"in_batch_{batch_id}"
+    status_error = f"error_{batch_id}"
+    rows = con.execute(
+        """
+        UPDATE my_db.mdr_reconciliation.MdrReconciliationTasks t
+        SET
+          Agent2Status = 'pending',
+          FinalStatus = CASE
+            WHEN t.FinalStatus IN ('in_progress', 'error') THEN 'pending'
+            ELSE t.FinalStatus
+          END,
+          UpdatedAt = ?
+        FROM (
+          SELECT t2.TaskId
+          FROM my_db.mdr_reconciliation.MdrReconciliationTasks t2
+          LEFT JOIN my_db.mdr_reconciliation.MdrReconciliationAgentDecisions d2
+            ON d2.TaskId = t2.TaskId
+           AND d2.AgentName = ?
+          WHERE t2.Agent2Status IN (?, ?, ?)
+            AND d2.TaskId IS NULL
+        ) x
+        WHERE t.TaskId = x.TaskId
+        RETURNING t.TaskId
+        """,
+        [ts, AGENT_NAME, status_submitted, status_in_batch, status_error],
+    ).fetchall()
+    return len(rows)
 
 
 def _extract_text_from_batch_message(message: Any) -> str:
@@ -791,7 +839,9 @@ def run_batch_collect(
     batch_id: str,
     model: str,
     poll_interval: int = 60,
-) -> None:
+    skip_done: bool = False,
+    db_commit_every: int = 200,
+) -> Dict[str, Any]:
     """Poll batch until ended, then stream results and write each to DB."""
     while True:
         batch = client.beta.messages.batches.retrieve(message_batch_id=batch_id)
@@ -810,6 +860,28 @@ def run_batch_collect(
     """, [status_in_batch, now_ts_naive_utc(), status_submitted])
     saved = 0
     errors = 0
+    skipped_done = 0
+    writes_since_commit = 0
+    transaction_open = False
+    candidates_cache: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
+
+    if db_commit_every <= 0:
+        db_commit_every = 200
+
+    con.execute("BEGIN;")
+    transaction_open = True
+
+    def commit_if_needed(force: bool = False) -> None:
+        nonlocal writes_since_commit, transaction_open
+        if not transaction_open:
+            return
+        if writes_since_commit <= 0:
+            return
+        if force or writes_since_commit >= db_commit_every:
+            con.execute("COMMIT;")
+            con.execute("BEGIN;")
+            writes_since_commit = 0
+
     # Stream can occasionally drop on large result sets; retry and skip already handled tasks.
     handled_task_ids: set[str] = set()
     stream_attempt = 0
@@ -826,10 +898,28 @@ def run_batch_collect(
                     continue
                 result_type = getattr(result, "type", None) or (result.get("type") if isinstance(result, dict) else None)
                 if result_type == "succeeded":
+                    row = con.execute("""
+                        SELECT TaskId, Document_title, PromptVersion, EmbeddingModel, Agent2Status
+                        FROM my_db.mdr_reconciliation.MdrReconciliationTasks
+                        WHERE TaskId = ?
+                    """, [task_id]).fetchone()
+                    if not row:
+                        errors += 1
+                        handled_task_ids.add(task_id)
+                        continue
+                    if skip_done and row[4] == "done":
+                        skipped_done += 1
+                        handled_task_ids.add(task_id)
+                        if skipped_done % 100 == 0:
+                            print(f"  skipped done: {skipped_done}")
+                        continue
+                    task = {"TaskId": row[0], "Document_title": row[1], "PromptVersion": row[2], "EmbeddingModel": row[3]}
                     msg = getattr(result, "message", None) or (result.get("message") if isinstance(result, dict) else None)
                     if not msg:
                         mark_agent2_error(con, task_id, batch_id=batch_id)
                         errors += 1
+                        writes_since_commit += 1
+                        commit_if_needed()
                         handled_task_ids.add(task_id)
                         continue
                     raw_text = _extract_text_from_batch_message(msg)
@@ -839,6 +929,8 @@ def run_batch_collect(
                     except (json.JSONDecodeError, ValueError) as e:
                         mark_agent2_error(con, task_id, batch_id=batch_id)
                         errors += 1
+                        writes_since_commit += 1
+                        commit_if_needed()
                         handled_task_ids.add(task_id)
                         print(f"  {task_id}: parse error {e}")
                         print("    ---- CLAUDE BATCH RAW TEXT BEGIN ----")
@@ -848,36 +940,53 @@ def run_batch_collect(
                         print(cleaned)
                         print("    ---- CLAUDE BATCH CLEANED JSON END ----")
                         continue
-                    row = con.execute("""
-                        SELECT TaskId, Document_title, PromptVersion, EmbeddingModel
-                        FROM my_db.mdr_reconciliation.MdrReconciliationTasks
-                        WHERE TaskId = ?
-                    """, [task_id]).fetchone()
-                    if not row:
-                        errors += 1
-                        handled_task_ids.add(task_id)
-                        continue
-                    task = {"TaskId": row[0], "Document_title": row[1], "PromptVersion": row[2], "EmbeddingModel": row[3]}
-                    candidates = fetch_candidates_for_task(con, task["Document_title"], task["PromptVersion"], task["EmbeddingModel"])
+                    candidate_key = (
+                        task["Document_title"],
+                        task["PromptVersion"],
+                        task["EmbeddingModel"],
+                    )
+                    candidates = candidates_cache.get(candidate_key)
+                    if candidates is None:
+                        candidates = fetch_candidates_for_task(
+                            con,
+                            task["Document_title"],
+                            task["PromptVersion"],
+                            task["EmbeddingModel"],
+                        )
+                        candidates_cache[candidate_key] = candidates
                     if not candidates:
                         mark_agent2_error(con, task_id, batch_id=batch_id)
                         errors += 1
+                        writes_since_commit += 1
+                        commit_if_needed()
                         handled_task_ids.add(task_id)
                         continue
                     try:
                         validated = validate_agent_output(raw_result, candidates)
-                        save_agent2_evaluation(con=con, task=task, model=model, result=validated)
+                        save_agent2_evaluation(
+                            con=con,
+                            task=task,
+                            model=model,
+                            result=validated,
+                            manage_transaction=False,
+                        )
                         saved += 1
+                        writes_since_commit += 1
+                        commit_if_needed()
                         handled_task_ids.add(task_id)
                         print(f"  {task_id} -> {validated['DecisionType']} (saved)")
                     except Exception as e:
                         mark_agent2_error(con, task_id, batch_id=batch_id)
                         errors += 1
+                        writes_since_commit += 1
+                        commit_if_needed()
                         handled_task_ids.add(task_id)
                         print(f"  {task_id}: validation/save error {e}")
                 else:
                     mark_agent2_error(con, task_id, batch_id=batch_id)
                     errors += 1
+                    writes_since_commit += 1
+                    commit_if_needed()
                     handled_task_ids.add(task_id)
                     print(f"  {task_id}: result type={result_type}")
             break
@@ -891,8 +1000,143 @@ def run_batch_collect(
                 )
                 time.sleep(wait_s)
                 continue
+            if transaction_open:
+                con.execute("ROLLBACK;")
+                transaction_open = False
             raise
-    print(f"Batch collect done: {saved} saved, {errors} errors.")
+    if transaction_open:
+        commit_if_needed(force=True)
+        con.execute("COMMIT;")
+    print(f"Batch collect done: {saved} saved, {errors} errors, {skipped_done} skipped_done.")
+    return {
+        "batch_id": batch_id,
+        "status": "completed",
+        "saved": saved,
+        "errors": errors,
+        "skipped_done": skipped_done,
+    }
+
+
+def run_batch_and_collect_adaptive(
+    con: duckdb.DuckDBPyConnection,
+    prompt_version: str,
+    embedding_model: str,
+    model: str,
+    target_max_bytes: int,
+    initial_limit: int,
+    min_limit: int,
+    max_limit: int,
+    backoff_factor: float,
+    growth_factor: float,
+    skip_done: bool,
+    max_rounds: Optional[int],
+    test_fixed_tasks: bool = False,
+    test_task_count: int = 150,
+) -> None:
+    current_limit = max(min_limit, min(max_limit, int(initial_limit)))
+    rounds = 0
+    fixed_task_ids: Optional[set] = None
+
+    if test_fixed_tasks:
+        all_pending = fetch_pending_tasks(
+            con=con,
+            prompt_version=prompt_version,
+            embedding_model=embedding_model,
+            limit=None,
+        )
+        fixed_tasks = load_or_create_test_tasks(all_pending, test_task_count)
+        fixed_task_ids = {str(t.get("TaskId")) for t in fixed_tasks if t.get("TaskId")}
+        print(f"Test mode: fixed TaskId loaded ({len(fixed_task_ids)} task).")
+
+    while True:
+        if max_rounds is not None and rounds >= max_rounds:
+            print(f"Stopping: reached max rounds ({max_rounds}).")
+            return
+
+        if fixed_task_ids is None:
+            tasks = fetch_pending_tasks(
+                con=con,
+                prompt_version=prompt_version,
+                embedding_model=embedding_model,
+                limit=current_limit,
+            )
+        else:
+            all_pending = fetch_pending_tasks(
+                con=con,
+                prompt_version=prompt_version,
+                embedding_model=embedding_model,
+                limit=None,
+            )
+            tasks = [t for t in all_pending if str(t.get("TaskId")) in fixed_task_ids][:current_limit]
+
+        if not tasks:
+            print("No pending tasks for adaptive batch-and-collect. Done.")
+            return
+
+        rounds += 1
+        print(
+            f"[Adaptive round {rounds}] submitting {len(tasks)} task(s) "
+            f"(current_limit={current_limit}, min={min_limit}, max={max_limit})"
+        )
+        try:
+            batch_ids = run_batch_submit_chunked(
+                con=con,
+                tasks=tasks,
+                model=model,
+                target_max_bytes=target_max_bytes,
+            )
+        except Exception as e:
+            next_limit = max(min_limit, int(max(1, current_limit) * float(backoff_factor)))
+            if next_limit == current_limit and current_limit > min_limit:
+                next_limit = current_limit - 1
+            current_limit = max(min_limit, next_limit)
+            print(
+                f"[Adaptive round {rounds}] submit failed ({e}). "
+                f"Reducing limit to {current_limit} and retrying."
+            )
+            continue
+
+        all_completed = True
+        for i, batch_id in enumerate(batch_ids, start=1):
+            print(f"[Adaptive round {rounds}] collecting batch {i}/{len(batch_ids)}: {batch_id}")
+            try:
+                collect_result = run_batch_collect(
+                    con=con,
+                    batch_id=batch_id,
+                    model=model,
+                    skip_done=skip_done,
+                )
+            except Exception as e:
+                reset_n = reset_agent2_batch_statuses_to_pending(con, batch_id)
+                print(
+                    f"[Adaptive round {rounds}] batch {batch_id} collect exception ({e}), "
+                    f"reset to pending: {reset_n} task(s)."
+                )
+                next_limit = max(min_limit, int(max(1, current_limit) * float(backoff_factor)))
+                if next_limit == current_limit and current_limit > min_limit:
+                    next_limit = current_limit - 1
+                current_limit = max(min_limit, next_limit)
+                all_completed = False
+                break
+            if collect_result["status"] != "completed":
+                reset_n = reset_agent2_batch_statuses_to_pending(con, batch_id)
+                print(
+                    f"[Adaptive round {rounds}] batch {batch_id} failed "
+                    f"({collect_result['status']}), reset to pending: {reset_n} task(s)."
+                )
+                next_limit = max(min_limit, int(max(1, current_limit) * float(backoff_factor)))
+                if next_limit == current_limit and current_limit > min_limit:
+                    next_limit = current_limit - 1
+                current_limit = max(min_limit, next_limit)
+                all_completed = False
+                break
+
+        if all_completed:
+            next_limit = min(max_limit, int(max(1, current_limit) * float(growth_factor)))
+            if next_limit == current_limit and current_limit < max_limit:
+                next_limit = current_limit + 1
+            current_limit = min(max_limit, next_limit)
+            print(f"[Adaptive round {rounds}] completed successfully. Next limit: {current_limit}")
 
 
 def process_one_agent2_task(
@@ -971,6 +1215,19 @@ def main():
     ap.add_argument("--batch", action="store_true", help="Use Batch API: submit pending tasks and exit (no rate limit; collect later with --batch-collect).")
     ap.add_argument("--batch-collect", action="store_true", help="Poll and collect all batch ids saved by latest submit in .agent2_last_batch_ids.json.")
     ap.add_argument(
+        "--batch-and-collect",
+        action="store_true",
+        help=(
+            "Adaptive loop: submit one tranche, collect immediately, and continue automatically. "
+            "On failed collect/submit, reset related statuses to pending and retry with lower limit."
+        ),
+    )
+    ap.add_argument(
+        "--batch-collect-skip-done",
+        action="store_true",
+        help="When used with --batch-collect, skip tasks already marked Agent2Status='done'.",
+    )
+    ap.add_argument(
         "--batch-max-bytes",
         type=int,
         default=DEFAULT_BATCH_TARGET_BYTES,
@@ -979,6 +1236,42 @@ def main():
             f"(default: {DEFAULT_BATCH_TARGET_BYTES}, hard max: {CLAUDE_BATCH_REQUEST_HARD_LIMIT_BYTES})."
         ),
     )
+    ap.add_argument(
+        "--batch-initial-limit",
+        type=int,
+        default=DEFAULT_ADAPTIVE_BATCH_INITIAL_LIMIT,
+        help=f"Initial tranche size for --batch-and-collect (default: {DEFAULT_ADAPTIVE_BATCH_INITIAL_LIMIT}).",
+    )
+    ap.add_argument(
+        "--batch-min-limit",
+        type=int,
+        default=DEFAULT_ADAPTIVE_BATCH_MIN_LIMIT,
+        help=f"Minimum tranche size for --batch-and-collect backoff (default: {DEFAULT_ADAPTIVE_BATCH_MIN_LIMIT}).",
+    )
+    ap.add_argument(
+        "--batch-max-limit",
+        type=int,
+        default=DEFAULT_ADAPTIVE_BATCH_MAX_LIMIT,
+        help=f"Maximum tranche size for --batch-and-collect growth (default: {DEFAULT_ADAPTIVE_BATCH_MAX_LIMIT}).",
+    )
+    ap.add_argument(
+        "--batch-backoff-factor",
+        type=float,
+        default=DEFAULT_ADAPTIVE_BATCH_BACKOFF_FACTOR,
+        help=f"Backoff multiplier after failed round in --batch-and-collect (default: {DEFAULT_ADAPTIVE_BATCH_BACKOFF_FACTOR}).",
+    )
+    ap.add_argument(
+        "--batch-growth-factor",
+        type=float,
+        default=DEFAULT_ADAPTIVE_BATCH_GROWTH_FACTOR,
+        help=f"Growth multiplier after successful round in --batch-and-collect (default: {DEFAULT_ADAPTIVE_BATCH_GROWTH_FACTOR}).",
+    )
+    ap.add_argument(
+        "--batch-max-rounds",
+        type=int,
+        default=None,
+        help="Optional max adaptive rounds for --batch-and-collect (default: no limit).",
+    )
     ap.add_argument("--test-fixed-tasks", action="store_true", help="Test mode: use a shared fixed list of TaskId stored in .recon_test_tasks.json.")
     ap.add_argument("--test-task-count", type=int, default=150, help="Number of random TaskId to pick when creating the shared test list (default: 150).")
     args = ap.parse_args()
@@ -986,10 +1279,39 @@ def main():
     args.prompt_version = args.prompt_version or _cfg("PROMPT_VERSION", "v1")
     args.embedding_model = args.embedding_model or "text-embedding-3-small"
     args.model = args.model or DEFAULT_MODEL
+    if args.batch_and_collect and (args.batch or args.batch_collect):
+        raise RuntimeError("Use --batch-and-collect alone (do not combine with --batch or --batch-collect).")
+    if args.batch_and_collect and args.batch_min_limit <= 0:
+        raise RuntimeError("--batch-min-limit must be > 0.")
+    if args.batch_and_collect and args.batch_max_limit < args.batch_min_limit:
+        raise RuntimeError("--batch-max-limit must be >= --batch-min-limit.")
+    if args.batch_and_collect and not (0 < args.batch_backoff_factor <= 1):
+        raise RuntimeError("--batch-backoff-factor must be in (0, 1].")
+    if args.batch_and_collect and args.batch_growth_factor < 1:
+        raise RuntimeError("--batch-growth-factor must be >= 1.")
 
     con = connect_motherduck()
     ensure_agent_eval_table(con)
     ensure_agent_top_candidates_table(con)
+    if args.batch_and_collect:
+        run_batch_and_collect_adaptive(
+            con=con,
+            prompt_version=args.prompt_version,
+            embedding_model=args.embedding_model,
+            model=args.model,
+            target_max_bytes=args.batch_max_bytes,
+            initial_limit=args.batch_initial_limit,
+            min_limit=args.batch_min_limit,
+            max_limit=args.batch_max_limit,
+            backoff_factor=args.batch_backoff_factor,
+            growth_factor=args.batch_growth_factor,
+            skip_done=args.batch_collect_skip_done,
+            max_rounds=args.batch_max_rounds,
+            test_fixed_tasks=args.test_fixed_tasks,
+            test_task_count=args.test_task_count,
+        )
+        con.close()
+        return
 
     if args.batch_collect:
         if not BATCH_IDS_FILE.exists():
@@ -1012,7 +1334,12 @@ def main():
         print(f"Collecting {len(batch_ids)} batch(es) from {BATCH_IDS_FILE.name}...")
         for i, batch_id in enumerate(batch_ids, start=1):
             print(f"[{i}/{len(batch_ids)}] Collecting results for batch: {batch_id}")
-            run_batch_collect(con=con, batch_id=batch_id, model=args.model)
+            run_batch_collect(
+                con=con,
+                batch_id=batch_id,
+                model=args.model,
+                skip_done=args.batch_collect_skip_done,
+            )
         con.close()
         return
 

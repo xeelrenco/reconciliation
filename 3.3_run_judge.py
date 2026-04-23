@@ -48,6 +48,11 @@ BATCH_INFOS_FILE = Path(__file__).resolve().parent / ".judge_last_batch_infos.js
 TEST_TASK_FILE = Path(__file__).resolve().parent / ".recon_test_tasks.json"
 VERTEX_BATCH_INPUT_FILE_HARD_LIMIT_BYTES = 1_000_000_000
 DEFAULT_BATCH_TARGET_BYTES = 800_000_000
+DEFAULT_ADAPTIVE_BATCH_INITIAL_LIMIT = 2000
+DEFAULT_ADAPTIVE_BATCH_MIN_LIMIT = 200
+DEFAULT_ADAPTIVE_BATCH_MAX_LIMIT = 7000
+DEFAULT_ADAPTIVE_BATCH_BACKOFF_FACTOR = 0.5
+DEFAULT_ADAPTIVE_BATCH_GROWTH_FACTOR = 1.2
 
 
 def load_config(path: Optional[Path] = None) -> Dict[str, str]:
@@ -1043,6 +1048,45 @@ def mark_judge_error(
     """, [status, ts, task_id])
 
 
+def reset_judge_batch_statuses_to_pending(
+    con: duckdb.DuckDBPyConnection,
+    batch_id: str,
+) -> int:
+    """
+    Reset submitted/in_batch/error statuses for one failed judge batch back to pending,
+    only for tasks that do not already have a judge_gemini decision saved.
+    """
+    ts = now_ts_naive_utc()
+    status_submitted = f"submitted_{batch_id}"
+    status_in_batch = f"in_batch_{batch_id}"
+    status_error = f"error_{batch_id}"
+    rows = con.execute(
+        f"""
+        UPDATE {TASKS_TABLE} t
+        SET
+          JudgeStatus = 'pending',
+          FinalStatus = CASE
+            WHEN t.FinalStatus IN ('in_progress', 'error') THEN 'pending'
+            ELSE t.FinalStatus
+          END,
+          UpdatedAt = ?
+        FROM (
+          SELECT t2.TaskId
+          FROM {TASKS_TABLE} t2
+          LEFT JOIN {AGENT_DECISIONS_TABLE} d2
+            ON d2.TaskId = t2.TaskId
+           AND d2.AgentName = ?
+          WHERE t2.JudgeStatus IN (?, ?, ?)
+            AND d2.TaskId IS NULL
+        ) x
+        WHERE t.TaskId = x.TaskId
+        RETURNING t.TaskId
+        """,
+        [ts, JUDGE_AGENT_NAME_GEMINI, status_submitted, status_in_batch, status_error],
+    ).fetchall()
+    return len(rows)
+
+
 def _vertex_batch_request_line(full_prompt: str) -> Dict[str, Any]:
     """One line (request dict) for Vertex batch JSONL: contents + generationConfig."""
     return {
@@ -1349,7 +1393,8 @@ def run_batch_collect(
     output_prompt_version: Optional[str] = None,
     poll_interval: int = 60,
     batch_info: Optional[Dict[str, Any]] = None,
-) -> None:
+    skip_done: bool = False,
+) -> Dict[str, Any]:
     """Poll Vertex batch job until completed, download output from GCS, write results to DB."""
     info = batch_info
     if info is None:
@@ -1383,7 +1428,7 @@ def run_batch_collect(
             break
         if state in _terminal_fail or (isinstance(state, str) and state in ("JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_PAUSED")):
             print(f"Batch {job_name} ended with state={state}. Cannot collect results.")
-            return
+            return {"batch_id": batch_id_short, "status": str(state), "saved": 0, "errors": 0, "skipped_done": 0}
         print(f"Batch {job_name} state={state}, waiting {poll_interval}s...")
         time.sleep(poll_interval)
 
@@ -1405,6 +1450,7 @@ def run_batch_collect(
 
     saved = 0
     errors = 0
+    skipped_done = 0
     expected_ids = set(str(x).strip().lower() for x in (task_ids or []) if str(x).strip())
     for i, line_obj in enumerate(output_lines):
         task_id = _extract_task_id_from_vertex_batch_line(line_obj)
@@ -1436,12 +1482,15 @@ def run_batch_collect(
             print(f"  {task_id}: JSON parse error {e}")
             continue
         db_row = con.execute(f"""
-            SELECT TaskId, Document_title, PromptVersion, EmbeddingModel
+            SELECT TaskId, Document_title, PromptVersion, EmbeddingModel, JudgeStatus
             FROM {TASKS_TABLE}
             WHERE TaskId = ?
         """, [task_id]).fetchone()
         if not db_row:
             errors += 1
+            continue
+        if skip_done and db_row[4] == "done":
+            skipped_done += 1
             continue
         task = {"TaskId": db_row[0], "Document_title": db_row[1], "PromptVersion": db_row[2], "EmbeddingModel": db_row[3]}
         candidates = fetch_candidates_for_task(con, task["Document_title"], task["PromptVersion"], task["EmbeddingModel"])
@@ -1463,13 +1512,147 @@ def run_batch_collect(
             errors += 1
             print(f"  {task_id}: validation/save error {e}")
 
-    print(f"Batch collect done: {saved} saved, {errors} errors.")
+    print(f"Batch collect done: {saved} saved, {errors} errors, {skipped_done} skipped_done.")
 
     # Pulizia bucket: rimuovi input JSONL e output di questo run
     try:
         _gcs_delete_batch_artifacts(bucket_name, input_blob, prefix, project_id)
     except Exception as e:
         print(f"  Bucket cleanup warning: {e}")
+    return {
+        "batch_id": batch_id_short,
+        "status": "completed",
+        "saved": saved,
+        "errors": errors,
+        "skipped_done": skipped_done,
+    }
+
+
+def run_batch_and_collect_adaptive(
+    con: duckdb.DuckDBPyConnection,
+    prompt_version: str,
+    embedding_model: str,
+    model: str,
+    output_prompt_version: Optional[str],
+    target_max_bytes: int,
+    initial_limit: int,
+    min_limit: int,
+    max_limit: int,
+    backoff_factor: float,
+    growth_factor: float,
+    skip_done: bool,
+    max_rounds: Optional[int],
+    test_fixed_tasks: bool = False,
+    test_task_count: int = 150,
+) -> None:
+    current_limit = max(min_limit, min(max_limit, int(initial_limit)))
+    rounds = 0
+    fixed_task_ids: Optional[set] = None
+
+    if test_fixed_tasks:
+        all_ready = fetch_ready_tasks(
+            con=con,
+            prompt_version=prompt_version,
+            embedding_model=embedding_model,
+            limit=None,
+        )
+        fixed_tasks = load_or_create_test_tasks(all_ready, test_task_count)
+        fixed_task_ids = {str(t.get("TaskId")) for t in fixed_tasks if t.get("TaskId")}
+        print(f"Test mode: fixed TaskId loaded ({len(fixed_task_ids)} task).")
+
+    while True:
+        if max_rounds is not None and rounds >= max_rounds:
+            print(f"Stopping: reached max rounds ({max_rounds}).")
+            return
+
+        if fixed_task_ids is None:
+            tasks = fetch_ready_tasks(
+                con=con,
+                prompt_version=prompt_version,
+                embedding_model=embedding_model,
+                limit=current_limit,
+            )
+        else:
+            all_ready = fetch_ready_tasks(
+                con=con,
+                prompt_version=prompt_version,
+                embedding_model=embedding_model,
+                limit=None,
+            )
+            tasks = [t for t in all_ready if str(t.get("TaskId")) in fixed_task_ids][:current_limit]
+
+        if not tasks:
+            print("No ready tasks for adaptive batch-and-collect. Done.")
+            return
+
+        rounds += 1
+        print(
+            f"[Adaptive round {rounds}] submitting {len(tasks)} task(s) "
+            f"(current_limit={current_limit}, min={min_limit}, max={max_limit})"
+        )
+        try:
+            batch_infos = run_batch_submit_chunked(
+                con=con,
+                tasks=tasks,
+                model=model,
+                output_prompt_version=output_prompt_version,
+                target_max_bytes=target_max_bytes,
+            )
+        except Exception as e:
+            next_limit = max(min_limit, int(max(1, current_limit) * float(backoff_factor)))
+            if next_limit == current_limit and current_limit > min_limit:
+                next_limit = current_limit - 1
+            current_limit = max(min_limit, next_limit)
+            print(
+                f"[Adaptive round {rounds}] submit failed ({e}). "
+                f"Reducing limit to {current_limit} and retrying."
+            )
+            continue
+
+        all_completed = True
+        for i, info in enumerate(batch_infos, start=1):
+            job_name = str(info.get("job_name", "")).strip()
+            batch_id_short = job_name.split("/")[-1] if "/" in job_name else job_name
+            print(f"[Adaptive round {rounds}] collecting batch {i}/{len(batch_infos)}: {job_name}")
+            try:
+                collect_result = run_batch_collect(
+                    con=con,
+                    model=model,
+                    output_prompt_version=output_prompt_version,
+                    batch_info=info,
+                    skip_done=skip_done,
+                )
+            except Exception as e:
+                reset_n = reset_judge_batch_statuses_to_pending(con, batch_id_short)
+                print(
+                    f"[Adaptive round {rounds}] batch {job_name} collect exception ({e}), "
+                    f"reset to pending: {reset_n} task(s)."
+                )
+                next_limit = max(min_limit, int(max(1, current_limit) * float(backoff_factor)))
+                if next_limit == current_limit and current_limit > min_limit:
+                    next_limit = current_limit - 1
+                current_limit = max(min_limit, next_limit)
+                all_completed = False
+                break
+            if collect_result["status"] != "completed":
+                reset_n = reset_judge_batch_statuses_to_pending(con, batch_id_short)
+                print(
+                    f"[Adaptive round {rounds}] batch {job_name} failed "
+                    f"({collect_result['status']}), reset to pending: {reset_n} task(s)."
+                )
+                next_limit = max(min_limit, int(max(1, current_limit) * float(backoff_factor)))
+                if next_limit == current_limit and current_limit > min_limit:
+                    next_limit = current_limit - 1
+                current_limit = max(min_limit, next_limit)
+                all_completed = False
+                break
+
+        if all_completed:
+            next_limit = min(max_limit, int(max(1, current_limit) * float(growth_factor)))
+            if next_limit == current_limit and current_limit < max_limit:
+                next_limit = current_limit + 1
+            current_limit = min(max_limit, next_limit)
+            print(f"[Adaptive round {rounds}] completed successfully. Next limit: {current_limit}")
 
 
 def process_one_judge_task(
@@ -1583,6 +1766,19 @@ def main():
     ap.add_argument("--batch", action="store_true", help="Use Batch API: submit ready tasks and exit (collect later with --batch-collect).")
     ap.add_argument("--batch-collect", action="store_true", help="Poll and collect all batch ids saved by latest submit in .judge_last_batch_infos.json.")
     ap.add_argument(
+        "--batch-and-collect",
+        action="store_true",
+        help=(
+            "Adaptive loop: submit one tranche, collect immediately, and continue automatically. "
+            "On failed collect/submit, reset related statuses to pending and retry with lower limit."
+        ),
+    )
+    ap.add_argument(
+        "--batch-collect-skip-done",
+        action="store_true",
+        help="When used with --batch-collect or --batch-and-collect, skip tasks already marked JudgeStatus='done'.",
+    )
+    ap.add_argument(
         "--batch-max-bytes",
         type=int,
         default=DEFAULT_BATCH_TARGET_BYTES,
@@ -1590,6 +1786,42 @@ def main():
             "Target max JSONL bytes per submitted Vertex batch chunk "
             f"(default: {DEFAULT_BATCH_TARGET_BYTES}, hard max: {VERTEX_BATCH_INPUT_FILE_HARD_LIMIT_BYTES})."
         ),
+    )
+    ap.add_argument(
+        "--batch-initial-limit",
+        type=int,
+        default=DEFAULT_ADAPTIVE_BATCH_INITIAL_LIMIT,
+        help=f"Initial tranche size for --batch-and-collect (default: {DEFAULT_ADAPTIVE_BATCH_INITIAL_LIMIT}).",
+    )
+    ap.add_argument(
+        "--batch-min-limit",
+        type=int,
+        default=DEFAULT_ADAPTIVE_BATCH_MIN_LIMIT,
+        help=f"Minimum tranche size for --batch-and-collect backoff (default: {DEFAULT_ADAPTIVE_BATCH_MIN_LIMIT}).",
+    )
+    ap.add_argument(
+        "--batch-max-limit",
+        type=int,
+        default=DEFAULT_ADAPTIVE_BATCH_MAX_LIMIT,
+        help=f"Maximum tranche size for --batch-and-collect growth (default: {DEFAULT_ADAPTIVE_BATCH_MAX_LIMIT}).",
+    )
+    ap.add_argument(
+        "--batch-backoff-factor",
+        type=float,
+        default=DEFAULT_ADAPTIVE_BATCH_BACKOFF_FACTOR,
+        help=f"Backoff multiplier after failed round in --batch-and-collect (default: {DEFAULT_ADAPTIVE_BATCH_BACKOFF_FACTOR}).",
+    )
+    ap.add_argument(
+        "--batch-growth-factor",
+        type=float,
+        default=DEFAULT_ADAPTIVE_BATCH_GROWTH_FACTOR,
+        help=f"Growth multiplier after successful round in --batch-and-collect (default: {DEFAULT_ADAPTIVE_BATCH_GROWTH_FACTOR}).",
+    )
+    ap.add_argument(
+        "--batch-max-rounds",
+        type=int,
+        default=None,
+        help="Optional max adaptive rounds for --batch-and-collect (default: no limit).",
     )
     ap.add_argument("--test-fixed-tasks", action="store_true", help="Test mode: use a shared fixed list of TaskId stored in .recon_test_tasks.json.")
     ap.add_argument("--test-task-count", type=int, default=150, help="Number of random TaskId to pick when creating the shared test list (default: 150).")
@@ -1599,10 +1831,40 @@ def main():
     args.embedding_model = args.embedding_model or "text-embedding-3-small"
     args.output_prompt_version = (args.output_prompt_version or _cfg("JUDGE_OUTPUT_PROMPT_VERSION") or "").strip() or None
     args.model = args.model or DEFAULT_MODEL
+    if args.batch_and_collect and (args.batch or args.batch_collect):
+        raise RuntimeError("Use --batch-and-collect alone (do not combine with --batch or --batch-collect).")
+    if args.batch_and_collect and args.batch_min_limit <= 0:
+        raise RuntimeError("--batch-min-limit must be > 0.")
+    if args.batch_and_collect and args.batch_max_limit < args.batch_min_limit:
+        raise RuntimeError("--batch-max-limit must be >= --batch-min-limit.")
+    if args.batch_and_collect and not (0 < args.batch_backoff_factor <= 1):
+        raise RuntimeError("--batch-backoff-factor must be in (0, 1].")
+    if args.batch_and_collect and args.batch_growth_factor < 1:
+        raise RuntimeError("--batch-growth-factor must be >= 1.")
 
     con = connect_motherduck()
     ensure_final_results_table(con)
     ensure_agent_top_candidates_table(con)
+    if args.batch_and_collect:
+        run_batch_and_collect_adaptive(
+            con=con,
+            prompt_version=args.prompt_version,
+            embedding_model=args.embedding_model,
+            model=args.model,
+            output_prompt_version=args.output_prompt_version,
+            target_max_bytes=args.batch_max_bytes,
+            initial_limit=args.batch_initial_limit,
+            min_limit=args.batch_min_limit,
+            max_limit=args.batch_max_limit,
+            backoff_factor=args.batch_backoff_factor,
+            growth_factor=args.batch_growth_factor,
+            skip_done=args.batch_collect_skip_done,
+            max_rounds=args.batch_max_rounds,
+            test_fixed_tasks=args.test_fixed_tasks,
+            test_task_count=args.test_task_count,
+        )
+        con.close()
+        return
 
     if args.batch_collect:
         if not BATCH_INFOS_FILE.exists():
@@ -1631,6 +1893,7 @@ def main():
                 model=args.model,
                 output_prompt_version=args.output_prompt_version,
                 batch_info=info,
+                skip_done=args.batch_collect_skip_done,
             )
         con.close()
         return
