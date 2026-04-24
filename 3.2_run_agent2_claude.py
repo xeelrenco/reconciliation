@@ -28,6 +28,8 @@ import threading
 import time
 import random
 import math
+import re
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -94,6 +96,22 @@ def norm(s):
     if s is None:
         return ""
     return " ".join(str(s).strip().split())
+
+
+def norm_key(s):
+    """
+    Soft normalization for robust key matching without changing semantics.
+    """
+    t = norm(s)
+    if not t:
+        return ""
+    t = unicodedata.normalize("NFKD", t)
+    t = "".join(ch for ch in t if not unicodedata.combining(ch))
+    t = t.lower()
+    t = t.replace("–", "-").replace("—", "-")
+    t = re.sub(r"[^a-z0-9]+", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
 
 
 def connect_motherduck() -> duckdb.DuckDBPyConnection:
@@ -347,6 +365,9 @@ Rules:
 - If decision_type is MATCH: selected_titlekey and selected_raci_title must equal the rank-1 candidate in top_candidates (same titlekey and raci_title).
 - If decision_type is NO_MATCH: selected_titlekey and selected_raci_title must be null. top_candidates may be empty or list up to 3 closest-but-insufficient candidates.
 - confidence between 0 and 1. reasoning_summary and why_plausible must be brief and factual.
+- selected_titlekey and every top_candidates[*].titlekey MUST be copied exactly from one provided candidate TitleKey (character-by-character, case-insensitive compare is not enough; do not paraphrase).
+- selected_raci_title and every top_candidates[*].raci_title MUST be copied exactly from the same chosen candidate row.
+- Never output explanatory text outside JSON. Never output two JSON objects. Never revise your answer after JSON.
 
 Output JSON only with: decision_type, selected_titlekey, selected_raci_title, confidence, reasoning_summary, top_candidates (array of {rank, titlekey, raci_title, confidence, why_plausible}).
 """
@@ -371,6 +392,8 @@ def build_user_prompt(mdr_ctx: Dict[str, Any], candidates: List[Dict[str, Any]])
     blocks.append("- Strong metadata incompatibility is a negative signal")
     blocks.append("- Choose MATCH only if one candidate is clearly stronger than the others")
     blocks.append("- Choose NO_MATCH if the best candidate is still weak, generic, or not clearly equivalent")
+    blocks.append("- titlekey/raci_title in output must be exact copy-paste from one provided candidate row")
+    blocks.append("- Output exactly one JSON object and nothing else")
     blocks.append("")
 
     blocks.append("CANDIDATES")
@@ -388,7 +411,13 @@ def build_user_prompt(mdr_ctx: Dict[str, Any], candidates: List[Dict[str, Any]])
         blocks.append(f"ChapterName: {norm(c['ChapterName'])}")
 
     blocks.append("")
-    blocks.append("Return JSON only.")
+    blocks.append("FINAL OUTPUT CONTRACT (MANDATORY)")
+    blocks.append("- Return exactly one JSON object (no prose, no markdown, no code fences).")
+    blocks.append("- decision_type must be MATCH or NO_MATCH.")
+    blocks.append("- If MATCH: selected_titlekey must equal top_candidates[0].titlekey exactly.")
+    blocks.append("- top_candidates.titlekey values must be exact TitleKey strings from CANDIDATES.")
+    blocks.append("- top_candidates.raci_title values must be exact RaciTitle strings from CANDIDATES.")
+    blocks.append("- If unsure, return NO_MATCH with null selected fields.")
 
     return "\n".join(blocks)
 
@@ -476,7 +505,11 @@ def call_agent(model: str, mdr_ctx: Dict[str, Any], candidates: List[Dict[str, A
 
 
 def validate_agent_output(result: Dict[str, Any], candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
-    candidate_map = {norm(c["TitleKey"]): c for c in candidates}
+    candidate_map: Dict[str, Dict[str, Any]] = {}
+    for c in candidates:
+        k = norm_key(c["TitleKey"])
+        if k and k not in candidate_map:
+            candidate_map[k] = c
 
     decision_type = result["decision_type"]
     selected_titlekey = result.get("selected_titlekey")
@@ -496,17 +529,19 @@ def validate_agent_output(result: Dict[str, Any], candidates: List[Dict[str, Any
     for i, item in enumerate(raw_top[:3]):
         rank = int(item.get("rank", i + 1))
         titlekey = norm(item.get("titlekey") or "")
-        if not titlekey or titlekey in seen_keys:
+        titlekey_key = norm_key(titlekey)
+        if not titlekey_key or titlekey_key in seen_keys:
             raise ValueError("top_candidates must contain distinct titlekeys; rank must be 1..N without gaps")
-        seen_keys.add(titlekey)
-        if titlekey not in candidate_map:
+        seen_keys.add(titlekey_key)
+        if titlekey_key not in candidate_map:
             raise ValueError(f"top_candidates titlekey not in provided candidates: {titlekey}")
         if rank != i + 1:
             raise ValueError("top_candidates ranks must be 1, 2, 3 with no gaps")
+        candidate = candidate_map[titlekey_key]
         top_candidates.append({
             "CandidateRankWithinAgent": rank,
-            "TitleKey": titlekey,
-            "RaciTitle": norm(item.get("raci_title") or candidate_map[titlekey]["RaciTitle"]),
+            "TitleKey": norm(candidate["TitleKey"]),
+            "RaciTitle": norm(item.get("raci_title") or candidate["RaciTitle"]),
             "CandidateConfidence": max(0.0, min(1.0, float(item.get("confidence", 0)))),
             "WhyPlausible": norm(item.get("why_plausible") or ""),
         })
@@ -528,17 +563,18 @@ def validate_agent_output(result: Dict[str, Any], candidates: List[Dict[str, Any
         raise ValueError("MATCH requires selected_titlekey")
 
     selected_titlekey = norm(selected_titlekey)
-
-    if selected_titlekey not in candidate_map:
+    selected_titlekey_key = norm_key(selected_titlekey)
+    if selected_titlekey_key not in candidate_map:
         raise ValueError(f"SelectedTitleKey not in provided candidates: {selected_titlekey}")
 
-    candidate = candidate_map[selected_titlekey]
+    candidate = candidate_map[selected_titlekey_key]
+    selected_titlekey = norm(candidate["TitleKey"])
 
     if not selected_raci_title:
         selected_raci_title = norm(candidate["RaciTitle"])
 
     # MATCH: must have at least one top_candidate and rank 1 must equal selected_titlekey
-    if not top_candidates or norm(top_candidates[0]["TitleKey"]) != selected_titlekey:
+    if not top_candidates or norm_key(top_candidates[0]["TitleKey"]) != norm_key(selected_titlekey):
         raise ValueError("When MATCH, top_candidates must contain selected_titlekey as rank 1")
 
     return {
@@ -840,7 +876,6 @@ def run_batch_collect(
     model: str,
     poll_interval: int = 60,
     skip_done: bool = False,
-    db_commit_every: int = 200,
 ) -> Dict[str, Any]:
     """Poll batch until ended, then stream results and write each to DB."""
     while True:
@@ -861,26 +896,7 @@ def run_batch_collect(
     saved = 0
     errors = 0
     skipped_done = 0
-    writes_since_commit = 0
-    transaction_open = False
     candidates_cache: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
-
-    if db_commit_every <= 0:
-        db_commit_every = 200
-
-    con.execute("BEGIN;")
-    transaction_open = True
-
-    def commit_if_needed(force: bool = False) -> None:
-        nonlocal writes_since_commit, transaction_open
-        if not transaction_open:
-            return
-        if writes_since_commit <= 0:
-            return
-        if force or writes_since_commit >= db_commit_every:
-            con.execute("COMMIT;")
-            con.execute("BEGIN;")
-            writes_since_commit = 0
 
     # Stream can occasionally drop on large result sets; retry and skip already handled tasks.
     handled_task_ids: set[str] = set()
@@ -918,8 +934,6 @@ def run_batch_collect(
                     if not msg:
                         mark_agent2_error(con, task_id, batch_id=batch_id)
                         errors += 1
-                        writes_since_commit += 1
-                        commit_if_needed()
                         handled_task_ids.add(task_id)
                         continue
                     raw_text = _extract_text_from_batch_message(msg)
@@ -929,8 +943,6 @@ def run_batch_collect(
                     except (json.JSONDecodeError, ValueError) as e:
                         mark_agent2_error(con, task_id, batch_id=batch_id)
                         errors += 1
-                        writes_since_commit += 1
-                        commit_if_needed()
                         handled_task_ids.add(task_id)
                         print(f"  {task_id}: parse error {e}")
                         print("    ---- CLAUDE BATCH RAW TEXT BEGIN ----")
@@ -957,36 +969,22 @@ def run_batch_collect(
                     if not candidates:
                         mark_agent2_error(con, task_id, batch_id=batch_id)
                         errors += 1
-                        writes_since_commit += 1
-                        commit_if_needed()
                         handled_task_ids.add(task_id)
                         continue
                     try:
                         validated = validate_agent_output(raw_result, candidates)
-                        save_agent2_evaluation(
-                            con=con,
-                            task=task,
-                            model=model,
-                            result=validated,
-                            manage_transaction=False,
-                        )
+                        save_agent2_evaluation(con=con, task=task, model=model, result=validated)
                         saved += 1
-                        writes_since_commit += 1
-                        commit_if_needed()
                         handled_task_ids.add(task_id)
                         print(f"  {task_id} -> {validated['DecisionType']} (saved)")
                     except Exception as e:
                         mark_agent2_error(con, task_id, batch_id=batch_id)
                         errors += 1
-                        writes_since_commit += 1
-                        commit_if_needed()
                         handled_task_ids.add(task_id)
                         print(f"  {task_id}: validation/save error {e}")
                 else:
                     mark_agent2_error(con, task_id, batch_id=batch_id)
                     errors += 1
-                    writes_since_commit += 1
-                    commit_if_needed()
                     handled_task_ids.add(task_id)
                     print(f"  {task_id}: result type={result_type}")
             break
@@ -1000,13 +998,7 @@ def run_batch_collect(
                 )
                 time.sleep(wait_s)
                 continue
-            if transaction_open:
-                con.execute("ROLLBACK;")
-                transaction_open = False
             raise
-    if transaction_open:
-        commit_if_needed(force=True)
-        con.execute("COMMIT;")
     print(f"Batch collect done: {saved} saved, {errors} errors, {skipped_done} skipped_done.")
     return {
         "batch_id": batch_id,

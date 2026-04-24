@@ -29,6 +29,8 @@ import tempfile
 import time
 import random
 import math
+import re
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -95,6 +97,22 @@ def norm(s):
     if s is None:
         return ""
     return " ".join(str(s).strip().split())
+
+
+def norm_key(s):
+    """
+    Soft normalization for robust key matching without changing semantics.
+    """
+    t = norm(s)
+    if not t:
+        return ""
+    t = unicodedata.normalize("NFKD", t)
+    t = "".join(ch for ch in t if not unicodedata.combining(ch))
+    t = t.lower()
+    t = t.replace("–", "-").replace("—", "-")
+    t = re.sub(r"[^a-z0-9]+", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
 
 
 def connect_motherduck() -> duckdb.DuckDBPyConnection:
@@ -457,7 +475,11 @@ def call_agent(model: str, mdr_ctx: Dict[str, Any], candidates: List[Dict[str, A
 
 
 def validate_agent_output(result: Dict[str, Any], candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
-    candidate_map = {norm(c["TitleKey"]): c for c in candidates}
+    candidate_map: Dict[str, Dict[str, Any]] = {}
+    for c in candidates:
+        k = norm_key(c["TitleKey"])
+        if k and k not in candidate_map:
+            candidate_map[k] = c
 
     decision_type = result["decision_type"]
     selected_titlekey = result.get("selected_titlekey")
@@ -477,17 +499,19 @@ def validate_agent_output(result: Dict[str, Any], candidates: List[Dict[str, Any
     for i, item in enumerate(raw_top[:3]):
         rank = int(item.get("rank", i + 1))
         titlekey = norm(item.get("titlekey") or "")
-        if not titlekey or titlekey in seen_keys:
+        titlekey_key = norm_key(titlekey)
+        if not titlekey_key or titlekey_key in seen_keys:
             raise ValueError("top_candidates must contain distinct titlekeys; rank must be 1..N without gaps")
-        seen_keys.add(titlekey)
-        if titlekey not in candidate_map:
+        seen_keys.add(titlekey_key)
+        if titlekey_key not in candidate_map:
             raise ValueError(f"top_candidates titlekey not in provided candidates: {titlekey}")
         if rank != i + 1:
             raise ValueError("top_candidates ranks must be 1, 2, 3 with no gaps")
+        candidate = candidate_map[titlekey_key]
         top_candidates.append({
             "CandidateRankWithinAgent": rank,
-            "TitleKey": titlekey,
-            "RaciTitle": norm(item.get("raci_title") or candidate_map[titlekey]["RaciTitle"]),
+            "TitleKey": norm(candidate["TitleKey"]),
+            "RaciTitle": norm(item.get("raci_title") or candidate["RaciTitle"]),
             "CandidateConfidence": max(0.0, min(1.0, float(item.get("confidence", 0)))),
             "WhyPlausible": norm(item.get("why_plausible") or ""),
         })
@@ -509,17 +533,18 @@ def validate_agent_output(result: Dict[str, Any], candidates: List[Dict[str, Any
         raise ValueError("MATCH requires selected_titlekey")
 
     selected_titlekey = norm(selected_titlekey)
-
-    if selected_titlekey not in candidate_map:
+    selected_titlekey_key = norm_key(selected_titlekey)
+    if selected_titlekey_key not in candidate_map:
         raise ValueError(f"SelectedTitleKey not in provided candidates: {selected_titlekey}")
 
-    candidate = candidate_map[selected_titlekey]
+    candidate = candidate_map[selected_titlekey_key]
+    selected_titlekey = norm(candidate["TitleKey"])
 
     if not selected_raci_title:
         selected_raci_title = norm(candidate["RaciTitle"])
 
     # MATCH: must have at least one top_candidate and rank 1 must equal selected_titlekey
-    if not top_candidates or norm(top_candidates[0]["TitleKey"]) != selected_titlekey:
+    if not top_candidates or norm_key(top_candidates[0]["TitleKey"]) != norm_key(selected_titlekey):
         raise ValueError("When MATCH, top_candidates must contain selected_titlekey as rank 1")
 
     return {
