@@ -1,0 +1,13 @@
+# Configurazione dedicata al restore MotherDuck.
+# Questo file e' separato da config.txt per evitare uso credenziali errate.
+# Copia in restore_config.txt e inserisci i valori reali.
+
+# Obbligatorio
+RESTORE_MOTHERDUCK_TOKEN=il_tuo_token_restore
+
+# Opzionale (default: my_db)
+RESTORE_MOTHERDUCK_DB=my_db
+
+# Opzionale: path backup da ripristinare (puoi poi usarlo nel comando)
+RESTORE_BACKUP_DIR=./backups/my_db_backup_YYYYMMDD_HHMMSS
+
