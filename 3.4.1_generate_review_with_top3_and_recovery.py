@@ -63,6 +63,19 @@ def _norm(s):
     return re.sub(r"\s+", " ", (s or "")).strip().lower()
 
 
+ILLEGAL_XLSX_CHARS_RE = re.compile(r"[\x00-\x08\x0B-\x0C\x0E-\x1F]")
+
+
+def _safe_excel_value(value):
+    """
+    Rimuove caratteri non ammessi da openpyxl/XML e limita la lunghezza stringa.
+    """
+    if not isinstance(value, str):
+        return value
+    cleaned = ILLEGAL_XLSX_CHARS_RE.sub("", value)
+    return cleaned[:32767]
+
+
 # ──────────────────────────────────────────────────────────────
 # QUERIES
 # ──────────────────────────────────────────────────────────────
@@ -259,7 +272,7 @@ def build_excel(rows):
         _build_sheet(ws, filtered, sheet_name)
 
     wb.save(OUTPUT_FILE)
-    print(f"\n✓  Salvato: {OUTPUT_FILE}")
+    print(f"\n[OK] Salvato: {OUTPUT_FILE}")
     for _, ef in SHEET_CONFIGS:
         n = len([r for r in rows if ef is None or r["esito"] == ef])
         print(f"   {ef or 'TOTALE'}: {n} righe")
@@ -326,7 +339,7 @@ def _build_sheet(ws, rows, title):
         ]
 
         for ci, val in enumerate(vals, 1):
-            c = ws.cell(row=r, column=ci, value=val)
+            c = ws.cell(row=r, column=ci, value=_safe_excel_value(val))
             c.border = _border(top)
 
             if ci in GPT_COLS:
@@ -401,9 +414,9 @@ def main():
         row["claude_candidates"] = task_cands["claude"]
 
     if not_found:
-        print(f"  ⚠  {not_found} titoli senza corrispondenza nella raw.")
+        print(f"  [WARN] {not_found} titoli senza corrispondenza nella raw.")
     else:
-        print("  ✓  Tutti i titoli hanno trovato numero documento e progetto.")
+        print("  [OK] Tutti i titoli hanno trovato numero documento e progetto.")
 
     print("Generazione Excel...")
     build_excel(rows)
